@@ -1,125 +1,25 @@
 """
-原型库 P（K × d）：
-- 离线 K-Means 或 GMM+BIC 初始化
-- 训练时作为 nn.Parameter 可学习微调
+原型库模块：
+- PrototypeLibrary（方案B: 纯 nn.Parameter，端到端梯度更新）
+- EMAPrototypeLibrary（方案C: nn.Parameter + EMA 影子副本 + 死原型重初始化）
+- sinkhorn() — Sinkhorn-Knopp 最优传输软分配
+- SwAVPrototypeLoss — 多视图交叉预测损失
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from sklearn.cluster import MiniBatchKMeans
-from sklearn.mixture import GaussianMixture
-
-
-def build_prototypes_kmeans(
-    token_features: np.ndarray,
-    num_prototypes: int = 512,
-    batch_size: int = 100000,
-    max_iter: int = 100,
-    random_state: int = 42,
-) -> np.ndarray:
-    """
-    对全局 token pool 运行 Mini-Batch K-Means，返回聚类中心。
-    Args:
-        token_features: (N, d) numpy array — 所有 token 的特征
-        num_prototypes: K
-    Returns:
-        centroids: (K, d) numpy array
-    """
-    print(f"[K-Means] Running MiniBatchKMeans: N={token_features.shape[0]}, K={num_prototypes} ...")
-    kmeans = MiniBatchKMeans(
-        n_clusters=num_prototypes,
-        batch_size=batch_size,
-        max_iter=max_iter,
-        random_state=random_state,
-        verbose=1,
-    )
-    kmeans.fit(token_features)
-    print(f"[K-Means] Done. Inertia={kmeans.inertia_:.4f}")
-    return kmeans.cluster_centers_.astype(np.float32)
-
-
-def build_prototypes_gmm(
-    features: np.ndarray,
-    candidate_ks: list = None,
-    random_state: int = 42,
-    max_samples: int = 50000,
-) -> tuple:
-    """
-    对特征运行 GMM + BIC 自适应选择最优 K，返回聚类中心。
-    Args:
-        features: (N, d) numpy array — sentence-level 或 token-level 特征
-        candidate_ks: 候选 K 列表
-        max_samples: 超过此数量时随机子采样（GMM 计算量大）
-    Returns:
-        (centroids, best_k):
-            centroids: (K, d) numpy array
-            best_k: int — BIC 选出的最优 K
-    """
-    if candidate_ks is None:
-        candidate_ks = [32, 64, 128, 256, 512]
-
-    N, d = features.shape
-    # 子采样以控制 GMM 计算量
-    if N > max_samples:
-        rng = np.random.RandomState(random_state)
-        indices = rng.choice(N, max_samples, replace=False)
-        fit_features = features[indices]
-        print(f"[GMM] Subsampled {N} → {max_samples} for fitting")
-    else:
-        fit_features = features
-
-    best_bic = float("inf")
-    best_k = candidate_ks[0]
-    best_gmm = None
-
-    print(f"[GMM+BIC] Fitting candidates K={candidate_ks} on {fit_features.shape[0]} samples, d={d} ...")
-    for k in candidate_ks:
-        if k > fit_features.shape[0]:
-            print(f"  K={k}: skipped (K > N_samples)")
-            continue
-        gmm = GaussianMixture(
-            n_components=k,
-            covariance_type="diag",
-            max_iter=100,
-            n_init=1,
-            random_state=random_state,
-            verbose=0,
-        )
-        gmm.fit(fit_features)
-        bic = gmm.bic(fit_features)
-        print(f"  K={k}: BIC={bic:.2f}")
-        if bic < best_bic:
-            best_bic = bic
-            best_k = k
-            best_gmm = gmm
-
-    print(f"[GMM+BIC] Best K={best_k}, BIC={best_bic:.2f}")
-
-    centroids = best_gmm.means_.astype(np.float32)  # (K, d)
-
-    # 打印聚类大小分布
-    labels = best_gmm.predict(fit_features)
-    unique, counts = np.unique(labels, return_counts=True)
-    print(f"[GMM] Cluster sizes: min={counts.min()}, max={counts.max()}, "
-          f"mean={counts.mean():.1f}, non-empty={len(unique)}/{best_k}")
-
-    return centroids, best_k
 
 
 class PrototypeLibrary(nn.Module):
     """
-    可学习原型库 P ∈ R^{K × d}。
-    可从 K-Means 中心初始化，也可随机初始化。
+    可学习原型库 P ∈ R^{K × d}（方案B）。
+    随机初始化，端到端通过梯度更新。
     """
 
-    def __init__(self, num_prototypes: int, feature_dim: int, init_weights: torch.Tensor = None):
+    def __init__(self, num_prototypes: int, feature_dim: int):
         super().__init__()
-        if init_weights is not None:
-            assert init_weights.shape == (num_prototypes, feature_dim)
-            self.prototypes = nn.Parameter(init_weights.clone())
-        else:
-            self.prototypes = nn.Parameter(torch.randn(num_prototypes, feature_dim) * 0.02)
+        self.prototypes = nn.Parameter(torch.empty(num_prototypes, feature_dim))
+        nn.init.xavier_uniform_(self.prototypes, gain=0.02)
 
     @property
     def K(self):
@@ -132,3 +32,143 @@ class PrototypeLibrary(nn.Module):
     def forward(self):
         """返回 L2 归一化的原型矩阵 (K, d)"""
         return F.normalize(self.prototypes, p=2, dim=-1)
+
+
+class EMAPrototypeLibrary(nn.Module):
+    """
+    可学习原型库 + EMA 影子副本（方案C）。
+    - prototypes: nn.Parameter，参与梯度优化
+    - ema_prototypes: buffer，指数移动平均副本，用于 Attention（稳定）
+    - usage_count: buffer，追踪每个原型的使用频率
+    """
+
+    def __init__(self, num_prototypes: int, feature_dim: int, ema_decay: float = 0.999):
+        super().__init__()
+        self.ema_decay = ema_decay
+        self.prototypes = nn.Parameter(torch.empty(num_prototypes, feature_dim))
+        nn.init.xavier_uniform_(self.prototypes, gain=0.02)
+
+        self.register_buffer("ema_prototypes", self.prototypes.data.clone())
+        self.register_buffer("usage_count", torch.zeros(num_prototypes))
+        self.register_buffer("total_steps", torch.zeros(1, dtype=torch.long))
+
+    @property
+    def K(self):
+        return self.prototypes.shape[0]
+
+    @property
+    def d(self):
+        return self.prototypes.shape[1]
+
+    def forward(self, use_ema: bool = False):
+        """返回 L2 归一化的原型矩阵 (K, d)"""
+        if use_ema:
+            return F.normalize(self.ema_prototypes, p=2, dim=-1)
+        return F.normalize(self.prototypes, p=2, dim=-1)
+
+    @torch.no_grad()
+    def update_ema(self):
+        """每步调用，更新 EMA 影子副本"""
+        self.ema_prototypes.mul_(self.ema_decay).add_(
+            self.prototypes.data, alpha=1.0 - self.ema_decay
+        )
+        self.total_steps += 1
+
+    @torch.no_grad()
+    def update_usage(self, s_T: torch.Tensor, threshold: float = 0.01):
+        """
+        根据查询激活向量更新使用计数。
+        Args:
+            s_T: (B, K) — 查询激活向量
+            threshold: 激活超过此值视为"被使用"
+        """
+        activated = (s_T.abs() > threshold).float().sum(dim=0)  # (K,)
+        mask = activated > 0
+        self.usage_count[mask] = 0
+        self.usage_count[~mask] += 1
+
+    @torch.no_grad()
+    def reinit_dead_prototypes(self, token_features: torch.Tensor, dead_threshold: int = 100):
+        """
+        重初始化连续 dead_threshold 步未被使用的原型。
+        Args:
+            token_features: (B, M, d) — 当前 batch 的 token 特征
+            dead_threshold: 连续未使用步数阈值
+        Returns:
+            n_dead: 重初始化的原型数量
+        """
+        dead_mask = self.usage_count >= dead_threshold
+        n_dead = dead_mask.sum().item()
+        if n_dead == 0:
+            return 0
+
+        B, M, d = token_features.shape
+        all_tokens = token_features.reshape(-1, d)
+        n_tokens = all_tokens.shape[0]
+        if n_tokens == 0:
+            return 0
+
+        indices = torch.randint(0, n_tokens, (n_dead,), device=all_tokens.device)
+        new_protos = F.normalize(all_tokens[indices], p=2, dim=-1)
+
+        dead_indices = dead_mask.nonzero(as_tuple=True)[0]
+        self.prototypes.data[dead_indices] = new_protos
+        self.ema_prototypes[dead_indices] = new_protos
+        self.usage_count[dead_indices] = 0
+        return n_dead
+
+
+@torch.no_grad()
+def sinkhorn(scores: torch.Tensor, eps: float = 0.05, niters: int = 3):
+    """
+    Sinkhorn-Knopp 最优传输，产出满足等分约束的软分配矩阵。
+    Args:
+        scores: (N, K) — 样本与原型的相似度
+        eps: 温度参数，越小分配越硬
+        niters: 迭代次数
+    Returns:
+        Q: (N, K) — detached 软分配矩阵
+    """
+    Q = torch.exp(scores / eps).T  # (K, N)
+    K, N = Q.shape
+    Q /= Q.sum()
+
+    for _ in range(niters):
+        Q /= Q.sum(dim=1, keepdim=True)
+        Q *= K
+        Q /= Q.sum(dim=0, keepdim=True)
+        Q *= N
+
+    return (Q / N).T  # (N, K)
+
+
+class SwAVPrototypeLoss(nn.Module):
+    """
+    SwAV 式多视图交叉预测损失。
+    两个视图的 μ 通过 Sinkhorn 得到伪标签 Q，交叉预测对方的 softmax 分布。
+    """
+
+    def __init__(self, sinkhorn_eps: float = 0.05, sinkhorn_iters: int = 3,
+                 swav_temperature: float = 0.1):
+        super().__init__()
+        self.sinkhorn_eps = sinkhorn_eps
+        self.sinkhorn_iters = sinkhorn_iters
+        self.swav_temperature = swav_temperature
+
+    def forward(self, mu1: torch.Tensor, mu2: torch.Tensor):
+        """
+        Args:
+            mu1: (B, K) — 视图1的视频均值表示
+            mu2: (B, K) — 视图2的视频均值表示
+        Returns:
+            loss: scalar
+        """
+        Q1 = sinkhorn(mu1, self.sinkhorn_eps, self.sinkhorn_iters)
+        Q2 = sinkhorn(mu2, self.sinkhorn_eps, self.sinkhorn_iters)
+
+        p1 = F.log_softmax(mu1 / self.swav_temperature, dim=-1)
+        p2 = F.log_softmax(mu2 / self.swav_temperature, dim=-1)
+
+        loss = -0.5 * (Q2 * p1).sum(dim=-1).mean() \
+               -0.5 * (Q1 * p2).sum(dim=-1).mean()
+        return loss

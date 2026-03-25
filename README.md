@@ -1,35 +1,40 @@
-# VIB-based Pseudo-Query Video Retrieval
+# Pseudo-Query Video Retrieval
 
-基于**变分信息瓶颈（VIB）**的伪查询视频检索 pipeline。核心思路：利用 VLM 生成的密集伪查询描述，通过全局聚类构建语义原型库，再经变分压缩网络映射为概率分布，最终在检索时通过 Cross-Attention 激活与不确定性感知评分完成 Text→Video 检索。
+基于**逐原型对比学习 + SwAV 在线原型学习**的伪查询视频检索 pipeline。核心思路：利用 VLM 生成的密集伪查询描述，通过在线学习的语义原型库进行 Prototype-guided Attention 聚合，再经逐原型对比损失和 SwAV 交叉预测训练，最终在检索时通过 cosine similarity 完成 Text→Video 检索。
+
+支持两种方案分支：
+- **方案B (SwAV)**：原型为 `nn.Parameter`，端到端梯度更新 + Sinkhorn 等分约束
+- **方案C (Hybrid)**：梯度原型 + EMA 影子副本（稳定视频编码）+ 死原型自动重初始化
 
 ## 项目结构
 
 ```
-pseudo query/
+pseudo-query/
 ├── configs/
 │   └── default.yaml              # 超参数配置文件
 ├── data/
 │   ├── __init__.py
 │   ├── preprocess.py             # 数据加载：MSR_VTT.json + narration.json 解析、split 划分
-│   └── dataset.py                # PyTorch Dataset / DataLoader / collate_fn
+│   └── dataset.py                # Multi-View Dataset / DataLoader / collate_fn
 ├── models/
 │   ├── __init__.py
 │   ├── clip_encoder.py           # CLIP Text Encoder 封装（冻结，自动下载）
-│   ├── prototype.py              # 原型库 P (K×d)：K-Means 初始化 + nn.Parameter
-│   ├── variational_encoder.py    # 变分压缩网络：Prototype-guided Attention → (μ, σ²)
-│   ├── query_assembly.py         # Cross-Attention 查询激活 + Max-Pooling 组装
-│   ├── scoring.py                # 不确定性感知评分、InfoNCE loss、KL divergence
-│   └── pipeline.py               # 完整 VIBPseudoQueryModel（组装所有模块）
+│   ├── prototype.py              # 原型库：PrototypeLibrary / EMAPrototypeLibrary / Sinkhorn / SwAVLoss
+│   ├── video_encoder.py          # 视频编码器：Prototype-guided Attention → (h, μ)
+│   ├── query_assembly.py         # Cross-Attention 查询激活 + Max-Pooling → (s_T, q̃)
+│   ├── scoring.py                # 逐原型对比损失 + cosine 推理评分
+│   ├── pipeline_swav.py          # 方案B 完整 Pipeline（SwAV Sinkhorn）
+│   └── pipeline_hybrid.py        # 方案C 完整 Pipeline（Hybrid EMA + SwAV）
 ├── scripts/
-│   ├── build_prototypes.py       # 离线脚本：全局 token 提取 → K-Means → 保存原型
-│   └── smoke_test.py             # 快速验证脚本：端到端 pipeline 正确性检查
+│   └── smoke_test.py             # 快速验证脚本：SwAV + Hybrid 双 pipeline 正确性检查
 ├── checkpoints/                  # 模型检查点保存目录
 ├── docs/
-│   ├── plan.md                   # 完整工程设计方案
+│   ├── pipeline.md               # 完整流程与数学推导
+│   ├── plan.md                   # 工程设计方案
 │   └── pq_1.md                   # 理论设计文档
 ├── MSR_VTT.json                  # MSR-VTT 标准元数据 + ground-truth 标注
 ├── MSRVTT_narration.json         # VLM 生成的密集伪查询描述（10K 视频）
-├── train.py                      # 训练主循环
+├── train.py                      # 训练主循环（多视图 + SwAV）
 ├── evaluate.py                   # 评估脚本：R@1/5/10, MdR, MnR
 ├── requirements.txt              # Python 依赖
 └── README.md
@@ -47,7 +52,6 @@ pip install -r requirements.txt
 - `torch >= 2.0.0`
 - `transformers >= 4.30.0`
 - `numpy >= 1.24.0`
-- `scikit-learn >= 1.2.0`
 - `pyyaml >= 6.0`
 - `tqdm >= 4.65.0`
 
@@ -80,27 +84,18 @@ pip install -r requirements.txt
 python scripts/smoke_test.py
 ```
 
-该脚本会依次测试：数据加载 → CLIP 编码 → 小规模 K-Means → 模型前向/反向传播 → 评估推理。看到 `ALL TESTS PASSED` 表示一切正常。
+该脚本会依次测试：数据加载 → CLIP 编码 → Multi-View 数据集 → SwAV Pipeline 前向/反向 → Hybrid Pipeline 前向/反向 → 评估推理。看到 `ALL SMOKE TESTS PASSED` 表示一切正常。
 
-### Step 2: 构建原型库（离线，一次性）
+### Step 2: 训练
 
-从所有伪查询中提取 token 级特征，运行 Mini-Batch K-Means 聚类生成原型库：
-
-```bash
-python scripts/build_prototypes.py --config configs/default.yaml
-```
-
-可选参数：
-- `--batch_size 256`：编码时的 batch size（根据 GPU 显存调整）
-- `--device cuda`：使用 GPU 加速编码
-
-产出文件：`checkpoints/prototypes.pt`（形状 `K × 512`，默认 K=512）
-
-> 全量 10K 视频约 1200 万 tokens，在 GPU 上编码约需 10~30 分钟。
-
-### Step 3: 训练
+无需离线构建原型库，原型完全在线学习。直接开始训练：
 
 ```bash
+# 方案B: SwAV（默认）
+python train.py --config configs/default.yaml
+
+# 方案C: Hybrid EMA + SwAV
+# 修改 configs/default.yaml 中 scheme: "hybrid"，然后运行：
 python train.py --config configs/default.yaml
 ```
 
@@ -109,19 +104,21 @@ python train.py --config configs/default.yaml
 - `--resume checkpoints/latest_model.pt`：从断点恢复训练
 
 训练行为：
-- **β-annealing**：KL 权重从 `1e-4` 线性增长至 `1e-2`，避免 posterior collapse
+- **多视图训练**：每个视频的伪查询随机分为两组，SwAV 交叉预测促进原型多样性
+- **损失函数**：L_match（逐原型对比） + α · L_swav（交叉预测）
 - **学习率**：AdamW + warmup + cosine decay
 - **混合精度**：GPU 上自动启用 FP16
 - **检查点**：每个 epoch 保存 `latest_model.pt`，验证集最优保存 `best_model.pt`
+- **方案C 附加**：每步执行 EMA 更新 + 死原型检测与重初始化
 
 训练日志示例：
 ```
-Epoch 1/30 [Train]: loss=4.8532 task=4.8531 kl=1.0023 beta=0.000100 tau=0.0700
+Epoch 1/30 [Train]: loss=4.8532 match=4.2156 swav=1.2752 tau=0.0700
 Epoch 1: train_loss=4.2156, val_loss=3.8901
   ✓ Best model saved (val_loss=3.8901)
 ```
 
-### Step 4: 评估
+### Step 3: 评估
 
 ```bash
 python evaluate.py --config configs/default.yaml --checkpoint checkpoints/best_model.pt
@@ -149,46 +146,50 @@ python evaluate.py --config configs/default.yaml --checkpoint checkpoints/best_m
 
 | 超参 | 默认值 | 说明 |
 |------|--------|------|
+| `scheme` | `swav` | 方案选择（`swav` / `hybrid`） |
 | `prototype.num_prototypes` | 512 | 原型数 K |
 | `model.aggregation` | `attention` | Token 聚合方式（`attention` / `mean`） |
 | `model.temperature_init` | 0.07 | 温度 τ 初始值（可学习） |
-| `model.variance_penalty` | 0.1 | 方差惩罚系数 λ |
+| `swav.sinkhorn_eps` | 0.05 | Sinkhorn 正则化系数 |
+| `swav.temperature` | 0.1 | SwAV 交叉预测温度 |
+| `training.swav_alpha` | 0.5 | L_swav 损失权重 α |
 | `training.batch_size` | 128 | 对比学习需大 batch |
 | `training.lr` | 1e-4 | 学习率 |
 | `training.epochs` | 30 | 训练轮数 |
-| `training.beta_start` | 1e-4 | β-annealing 起始值 |
-| `training.beta_end` | 1e-2 | β-annealing 终止值 |
+| `ema.decay` | 0.999 | EMA 衰减系数（方案C） |
+| `ema.dead_proto_threshold` | 100 | 死原型判定步数（方案C） |
 
 ## 方法概述
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│                    训练阶段                               │
+│                    训练阶段（多视图）                      │
 │                                                          │
-│  视频伪查询 captions ──→ CLIP Text Encoder (冻结)         │
-│       ↓                                                  │
-│  Token 特征 {t₁,...,tₘ} ──→ Prototype-guided Attention   │
-│       ↓                                                  │
-│  聚合特征 h ──→ Mean Head → μ ∈ ℝᴷ                       │
-│              └→ Var Head  → σ² ∈ ℝᴷ (Softplus)          │
-│       ↓                                                  │
-│  重参数化采样 m = μ + ε·σ                                 │
+│  视频伪查询 → 随机二分为 View1, View2                     │
+│       ↓                     ↓                            │
+│  CLIP Token Encoder    CLIP Token Encoder  (冻结)        │
+│       ↓                     ↓                            │
+│  Prototype-guided      Prototype-guided                  │
+│  Attention             Attention                         │
+│       ↓                     ↓                            │
+│  h₁, μ₁ ∈ ℝᴷ          h₂, μ₂ ∈ ℝᴷ                     │
+│       └──── SwAV ────────────┘                           │
+│              (Sinkhorn 交叉预测)                          │
 │                                                          │
-│  GT 查询文本 ──→ CLIP Text Encoder → Cross-Attention      │
-│       ↓            with 原型库 P                          │
-│  Max-Pooling → 查询激活 s_T ∈ ℝᴷ                         │
+│  GT 查询文本 → CLIP → Cross-Attention + MaxPool           │
 │       ↓                                                  │
-│  Score = s_Tᵀ m - λ · s_Tᵀ σ²   (不确定性感知评分)        │
+│  s_T ∈ ℝᴷ (查询激活)    q̃ ∈ ℝᴷˣᵈ (逐原型查询语义)       │
 │       ↓                                                  │
-│  Loss = InfoNCE(双向) + β · KL(N(μ,σ²) ‖ N(0,I))        │
+│  L_match = 逐原型对比损失(h_avg, q̃, s_T)                 │
+│  L_total = L_match + α · L_swav                          │
 └──────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────┐
 │                    检索阶段                               │
 │                                                          │
-│  输入查询 → encode_query → s_T                            │
-│  所有视频 → encode_video → (μ, σ²)   [可离线预计算]       │
-│  Score(T, Vᵢ) = s_Tᵀ μᵢ - λ Σₖ s_{T,k}·σ²_{i,k}       │
+│  输入查询 → get_query_repr → s_T ∈ ℝᴷ                    │
+│  所有视频 → get_video_repr → μ ∈ ℝᴷ   [可离线预计算]      │
+│  Score(T, Vᵢ) = cosine(s_T, μᵢ) / τ                     │
 │  按 Score 降序排列 → Top-K 检索结果                        │
 └──────────────────────────────────────────────────────────┘
 ```
@@ -197,9 +198,9 @@ python evaluate.py --config configs/default.yaml --checkpoint checkpoints/best_m
 
 | 模块 | 参数量级 | 说明 |
 |------|---------|------|
-| 原型库 P | K × d | K-Means 初始化，训练中微调 |
+| 原型库 P | K × d | Xavier 随机初始化，在线学习 |
 | Prototype-guided Attention | ~4d² | 多头注意力聚合 |
-| Mean Head | d × K | 线性映射 → μ |
-| Var Head | d × K | 线性映射 + Softplus → σ² |
+| Mean Head | d → 1 | 线性映射 → μ |
 | 温度 τ | 1 | 可学习标量 |
+| EMA 影子原型 (方案C) | K × d | buffer，不参与梯度 |
 | **CLIP Text Encoder** | **~63M** | **冻结，不参与训练** |

@@ -1,71 +1,68 @@
 """
-不确定性感知匹配评分 & 损失计算。
-- Cosine similarity + 可学习温度
-- Free-bits KL 正则
-- 方差惩罚已停用（代码保留）
+逐原型细粒度对比损失 & 推理评分。
+- prototype_anchored_contrastive_loss: 训练用，逐原型对比 h vs q̃
+- cosine_retrieval_score: 推理用，全局余弦 s_T vs μ
 """
+from typing import Union
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 
-def uncertainty_aware_score(s_T, mu, sigma_sq=None, variance_penalty: float = 0.1, temperature: float = 1.0):
+def prototype_anchored_contrastive_loss(
+    h: torch.Tensor,
+    q_tilde: torch.Tensor,
+    s_T: torch.Tensor,
+    temperature: Union[float, torch.Tensor] = 1.0,
+):
     """
-    Score(T, V_i) = cosine_sim(s_T, μ_i) / τ
-    方差惩罚已停用（保留代码）。
+    逐原型细粒度对比损失（对称 InfoNCE）。
+
+    在每个原型 k 的 R^d 空间中独立计算视频-查询相似度，
+    然后以查询激活权重 s_T 加权求和得到最终对比分数。
 
     Args:
-        s_T: (B_q, K) — 已 L2 归一化的查询激活向量
-        mu: (B_v, K) — 已 L2 归一化的视频均值向量
-        sigma_sq: (B_v, K) — 视频方差向量（当前未使用）
-        variance_penalty: λ（当前未使用）
-        temperature: τ — 温度缩放
+        h: (B, K, d) — 视频侧逐原型聚合特征（L2归一化前）
+        q_tilde: (B, K, d) — 查询侧逐原型聚合语义（已 L2 归一化）
+        s_T: (B, K) — 查询激活权重
+        temperature: scalar
     Returns:
-        scores: (B_q, B_v)
+        loss: scalar — 对称 InfoNCE
     """
-    # Cosine similarity（s_T 和 mu 已经 L2 归一化，点积即 cosine）
-    match_score = torch.matmul(s_T, mu.T) / temperature  # (B_q, B_v)
+    B = h.shape[0]
 
-    # 方差惩罚（停用，保留代码）
-    # penalty = torch.matmul(s_T, sigma_sq.T)
-    # return match_score - variance_penalty * penalty
+    # L2 归一化
+    h_norm = F.normalize(h, p=2, dim=-1)       # (B, K, d)
+    q_norm = F.normalize(q_tilde, p=2, dim=-1)  # (B, K, d)
 
-    return match_score
+    # 逐原型相似度矩阵: (B, B, K)
+    # sim[i, j, k] = cosine(h_i_k, q_j_k)
+    sim_per_proto = torch.einsum("bkd, ckd -> bck", h_norm, q_norm)  # (B, B, K)
 
+    # 加权求和: w_ik * sim[i, j, k] → (B, B)
+    w = F.normalize(s_T, p=1, dim=-1)  # (B, K), L1 归一化
+    scores = torch.einsum("bck, ck -> bc", sim_per_proto, w) / temperature  # (B, B)
 
-def info_nce_loss(scores):
-    """
-    对称 InfoNCE loss（双向: text→video + video→text）。
-    支持非方阵输入（Memory Bank 场景）。
-    Args:
-        scores: (B, B+Q) — 前 B 列对角线为正样本
-    Returns:
-        loss: scalar
-    """
-    B = scores.shape[0]
     labels = torch.arange(B, device=scores.device)
     # Text → Video
     loss_t2v = F.cross_entropy(scores, labels)
-    # Video → Text（仅取 B×B 子矩阵）
-    loss_v2t = F.cross_entropy(scores[:B, :B].T, labels)
+    # Video → Text
+    loss_v2t = F.cross_entropy(scores.T, labels)
     return (loss_t2v + loss_v2t) / 2
 
 
-def kl_divergence(mu, sigma_sq, free_bits: float = 0.0):
+def cosine_retrieval_score(
+    s_T: torch.Tensor,
+    mu: torch.Tensor,
+    temperature: Union[float, torch.Tensor] = 1.0,
+):
     """
-    KL(N(μ, Σ) || N(0, I))  闭式解 + Free-bits。
+    推理用评分：余弦相似度 / 温度。
+
     Args:
-        mu: (B, K)
-        sigma_sq: (B, K) — 方差（非标准差）
-        free_bits: 每维 KL 低于此阈值不惩罚
+        s_T: (B_q, K) — L2归一化的查询激活向量
+        mu: (B_v, K) — L2归一化的视频均值向量
+        temperature: scalar
     Returns:
-        kl: scalar (batch 均值)
+        scores: (B_q, B_v)
     """
-    # D_KL = 0.5 * Σ_k (σ²_k + μ²_k - 1 - ln(σ²_k))
-    kl_per_dim = 0.5 * (sigma_sq + mu.pow(2) - 1 - torch.log(sigma_sq + 1e-8))  # (B, K)
-
-    if free_bits > 0:
-        # Free-bits: 每个维度的 KL 超过阈值才惩罚
-        kl_per_dim = F.relu(kl_per_dim - free_bits)
-
-    return kl_per_dim.sum(dim=-1).mean()
+    return torch.matmul(s_T, mu.T) / temperature

@@ -1,13 +1,15 @@
 # ============================================================
-# VIB-based Pseudo-Query Video Retrieval — Default Config
+# Pseudo-Query Video Retrieval — Default Config
+# 支持方案B (SwAV) 和方案C (Hybrid EMA+SwAV)
 # ============================================================
+
+# ---------- scheme ----------
+scheme: "swav"                                       # swav | hybrid
 
 # ---------- paths ----------
 data:
   msrvtt_json: "MSR_VTT.json"
   narration_json: "MSRVTT_narration.json"
-  prototype_path: "checkpoints/prototypes.pt"       # 离线聚类产出
-  token_cache_dir: "cache/token_features"            # 缓存编码后的token特征
 
 # ---------- encoder ----------
 encoder:
@@ -17,18 +19,24 @@ encoder:
 
 # ---------- prototype ----------
 prototype:
-  method: "gmm"                                      # gmm | kmeans
-  candidate_ks: [32, 64, 128, 256, 512]              # GMM+BIC 候选 K
-  num_prototypes: 512                                # K — kmeans 模式下使用；gmm 模式自动选择
-  kmeans_batch_size: 100000                          # Mini-Batch K-Means 批大小
-  kmeans_max_iter: 100
+  num_prototypes: 512                                # K — 原型数量
 
 # ---------- model ----------
 model:
   aggregation: "attention"                           # attention | mean
   temperature_init: 0.07                             # τ 初始值（可学习）
-  variance_penalty: 0.1                              # λ — 方差惩罚系数（当前已停用）
-  free_bits: 0.1                                     # KL free-bits 阈值
+
+# ---------- SwAV ----------
+swav:
+  sinkhorn_eps: 0.05                                 # Sinkhorn 正则化系数
+  sinkhorn_iters: 3                                  # Sinkhorn 迭代次数
+  temperature: 0.1                                   # SwAV 交叉预测温度
+  loss_weight: 0.5                                   # SwAV 损失权重 (α)
+
+# ---------- EMA (仅方案C) ----------
+ema:
+  decay: 0.999                                       # EMA 衰减系数
+  dead_proto_threshold: 100                          # 死原型判定步数阈值
 
 # ---------- training ----------
 training:
@@ -38,13 +46,10 @@ training:
   lr: 1.0e-4
   weight_decay: 0.01
   warmup_ratio: 0.1
-  beta_start: 1.0e-6                                # β-annealing 起始（降低两个数量级）
-  beta_end: 1.0e-4                                   # β-annealing 终止（降低两个数量级）
   gradient_clip: 1.0
   num_workers: 4
   fp16: true
-  memory_bank_size: 4096                             # Memory Bank 大小（0=禁用）
-  use_memory_bank: true                              # 是否启用 Memory Bank
+  swav_alpha: 0.5                                    # L_swav 损失权重
 
 # ---------- split (MSR-VTT standard) ----------
 split:

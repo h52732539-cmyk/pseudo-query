@@ -1,18 +1,18 @@
 """
 PyTorch Dataset: 返回 (视频伪查询token特征, 查询文本) 用于训练和评估。
-训练时按 (video_id, query_text) 配对采样；
+训练时按 (video_id, query_text) 配对采样，支持多视图（caption 分两组）；
 评估时分别构建 video gallery 和 query list。
 """
+import random
 import torch
 from torch.utils.data import Dataset
 from typing import Dict, List, Tuple, Optional
 
 
-class PseudoQueryTrainDataset(Dataset):
+class PseudoQueryMultiViewDataset(Dataset):
     """
-    训练数据集。每条样本是一个 (video_id, query_text) 正样本对。
-    视频侧：该视频的所有伪查询 caption 文本列表（由 collate 时编码）。
-    查询侧：一条 ground-truth query 文本。
+    多视图训练数据集。每条样本输出 (video_id, captions_view1, captions_view2, query_text)。
+    视频的 captions 随机打乱后分为两组作为多视图。
     """
 
     def __init__(
@@ -28,8 +28,12 @@ class PseudoQueryTrainDataset(Dataset):
 
     def __getitem__(self, idx):
         vid, query = self.pairs[idx]
-        captions = self.narrations[vid]  # List[str]
-        return vid, captions, query
+        captions = list(self.narrations[vid])  # copy to avoid mutating
+        random.shuffle(captions)
+        mid = max(1, len(captions) // 2)
+        view1 = captions[:mid]
+        view2 = captions[mid:] if mid < len(captions) else captions[:mid]
+        return vid, view1, view2, query
 
 
 class PseudoQueryEvalDataset(Dataset):
@@ -52,17 +56,20 @@ class PseudoQueryEvalDataset(Dataset):
         return vid, captions
 
 
-def train_collate_fn(batch):
+def multiview_collate_fn(batch):
     """
+    多视图训练 collate。
     返回:
         video_ids: List[str]
-        all_captions: List[List[str]]  — 每个视频的伪查询文本列表
+        captions_view1: List[List[str]]
+        captions_view2: List[List[str]]
         queries: List[str]
     """
     video_ids = [b[0] for b in batch]
-    all_captions = [b[1] for b in batch]
-    queries = [b[2] for b in batch]
-    return video_ids, all_captions, queries
+    captions_view1 = [b[1] for b in batch]
+    captions_view2 = [b[2] for b in batch]
+    queries = [b[3] for b in batch]
+    return video_ids, captions_view1, captions_view2, queries
 
 
 def eval_collate_fn(batch):

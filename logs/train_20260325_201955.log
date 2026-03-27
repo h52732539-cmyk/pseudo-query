@@ -1,0 +1,59 @@
+2026-03-25 20:19:55,650 | INFO | Config: configs/default.yaml, Scheme: swav
+2026-03-25 20:19:55,650 | INFO | Log file: logs/train_20260325_201955.log
+2026-03-25 20:19:55,650 | INFO | Device: cuda
+2026-03-25 20:19:56,203 | INFO | Train pairs: 130260, Val pairs: 9940
+2026-03-25 20:20:00,925 | INFO | Model: SwAVPipelineModel, K=512
+2026-03-25 21:28:04,066 | INFO | Epoch 1: train_loss=7.1298, val_loss=6.8858
+2026-03-25 21:28:04,068 | INFO | EPOCH_SUMMARY | epoch=1 | train_loss=7.129759 | val_loss=6.885806 | swav_alpha=0.5 | tau=0.068534 | lr=0.00003333
+2026-03-25 21:28:04,088 | INFO |   ✓ Best model saved (val_loss=6.8858)
+2026-03-25 22:39:01,557 | INFO | Epoch 2: train_loss=5.9088, val_loss=6.7189
+2026-03-25 22:39:01,558 | INFO | EPOCH_SUMMARY | epoch=2 | train_loss=5.908800 | val_loss=6.718855 | swav_alpha=0.5 | tau=0.064852 | lr=0.00006667
+2026-03-25 22:39:01,576 | INFO |   ✓ Best model saved (val_loss=6.7189)
+2026-03-25 23:49:52,287 | INFO | Epoch 3: train_loss=5.4103, val_loss=6.5735
+2026-03-25 23:49:52,288 | INFO | EPOCH_SUMMARY | epoch=3 | train_loss=5.410329 | val_loss=6.573513 | swav_alpha=0.5 | tau=0.059660 | lr=0.00010000
+2026-03-25 23:49:52,305 | INFO |   ✓ Best model saved (val_loss=6.5735)
+2026-03-26 01:00:41,607 | INFO | Epoch 4: train_loss=4.9746, val_loss=6.5535
+2026-03-26 01:00:41,607 | INFO | EPOCH_SUMMARY | epoch=4 | train_loss=4.974611 | val_loss=6.553479 | swav_alpha=0.5 | tau=0.054551 | lr=0.00009966
+2026-03-26 01:00:41,623 | INFO |   ✓ Best model saved (val_loss=6.5535)
+2026-03-26 02:11:32,318 | INFO | Epoch 5: train_loss=4.7259, val_loss=6.5553
+2026-03-26 02:11:32,319 | INFO | EPOCH_SUMMARY | epoch=5 | train_loss=4.725913 | val_loss=6.555320 | swav_alpha=0.5 | tau=0.050310 | lr=0.00009865
+2026-03-26 03:22:27,582 | INFO | Epoch 6: train_loss=4.5989, val_loss=6.5783
+2026-03-26 03:22:27,582 | INFO | EPOCH_SUMMARY | epoch=6 | train_loss=4.598880 | val_loss=6.578262 | swav_alpha=0.5 | tau=0.046522 | lr=0.00009698
+2026-03-26 04:33:20,105 | INFO | Epoch 7: train_loss=4.6005, val_loss=6.6283
+2026-03-26 04:33:20,106 | INFO | EPOCH_SUMMARY | epoch=7 | train_loss=4.600482 | val_loss=6.628274 | swav_alpha=0.5 | tau=0.042585 | lr=0.00009468
+2026-03-26 05:44:14,283 | INFO | Epoch 8: train_loss=4.5443, val_loss=6.6411
+2026-03-26 05:44:14,284 | INFO | EPOCH_SUMMARY | epoch=8 | train_loss=4.544252 | val_loss=6.641115 | swav_alpha=0.5 | tau=0.039133 | lr=0.00009177
+2026-03-26 06:55:04,341 | INFO | Epoch 9: train_loss=4.4464, val_loss=6.6553
+2026-03-26 06:55:04,342 | INFO | EPOCH_SUMMARY | epoch=9 | train_loss=4.446449 | val_loss=6.655256 | swav_alpha=0.5 | tau=0.036066 | lr=0.00008830
+2026-03-26 08:06:02,162 | INFO | Epoch 10: train_loss=4.3692, val_loss=6.6921
+2026-03-26 08:06:02,163 | INFO | EPOCH_SUMMARY | epoch=10 | train_loss=4.369186 | val_loss=6.692084 | swav_alpha=0.5 | tau=0.033395 | lr=0.00008431
+2026-03-26 09:16:56,662 | INFO | Epoch 11: train_loss=4.2885, val_loss=6.6931
+2026-03-26 09:16:56,665 | INFO | EPOCH_SUMMARY | epoch=11 | train_loss=4.288489 | val_loss=6.693135 | swav_alpha=0.5 | tau=0.031095 | lr=0.00007986
+2026-03-26 10:28:44,059 | INFO | Epoch 12: train_loss=4.2149, val_loss=6.7017
+2026-03-26 10:28:44,063 | INFO | EPOCH_SUMMARY | epoch=12 | train_loss=4.214875 | val_loss=6.701695 | swav_alpha=0.5 | tau=0.029057 | lr=0.00007500
+2026-03-26 11:40:38,788 | INFO | Epoch 13: train_loss=4.1397, val_loss=6.7406
+2026-03-26 11:40:38,789 | INFO | EPOCH_SUMMARY | epoch=13 | train_loss=4.139674 | val_loss=6.740599 | swav_alpha=0.5 | tau=0.027319 | lr=0.00006980
+2026-03-26 12:51:41,206 | INFO | Epoch 14: train_loss=4.0856, val_loss=6.7516
+2026-03-26 12:51:41,207 | INFO | EPOCH_SUMMARY | epoch=14 | train_loss=4.085631 | val_loss=6.751644 | swav_alpha=0.5 | tau=0.025792 | lr=0.00006434
+2026-03-26 14:02:19,355 | INFO | Epoch 15: train_loss=4.0294, val_loss=6.7754
+2026-03-26 14:02:19,356 | INFO | EPOCH_SUMMARY | epoch=15 | train_loss=4.029404 | val_loss=6.775411 | swav_alpha=0.5 | tau=0.024476 | lr=0.00005868
+2026-03-26 15:13:13,379 | INFO | Epoch 16: train_loss=3.9813, val_loss=6.8028
+2026-03-26 15:13:13,380 | INFO | EPOCH_SUMMARY | epoch=16 | train_loss=3.981322 | val_loss=6.802767 | swav_alpha=0.5 | tau=0.023334 | lr=0.00005291
+2026-03-26 16:24:15,545 | INFO | Epoch 17: train_loss=3.9339, val_loss=6.8446
+2026-03-26 16:24:15,560 | INFO | EPOCH_SUMMARY | epoch=17 | train_loss=3.933928 | val_loss=6.844583 | swav_alpha=0.5 | tau=0.022362 | lr=0.00004709
+2026-03-26 17:35:23,529 | INFO | Epoch 18: train_loss=3.9571, val_loss=6.8375
+2026-03-26 17:35:23,559 | INFO | EPOCH_SUMMARY | epoch=18 | train_loss=3.957094 | val_loss=6.837489 | swav_alpha=0.5 | tau=0.021382 | lr=0.00004132
+2026-03-26 18:46:10,445 | INFO | Epoch 19: train_loss=3.9362, val_loss=6.8649
+2026-03-26 18:46:10,459 | INFO | EPOCH_SUMMARY | epoch=19 | train_loss=3.936216 | val_loss=6.864861 | swav_alpha=0.5 | tau=0.020613 | lr=0.00003566
+2026-03-26 20:50:03,155 | INFO | Epoch 20: train_loss=3.9083, val_loss=6.8678
+2026-03-26 20:50:03,180 | INFO | EPOCH_SUMMARY | epoch=20 | train_loss=3.908250 | val_loss=6.867775 | swav_alpha=0.5 | tau=0.020002 | lr=0.00003020
+2026-03-26 23:14:09,101 | INFO | Epoch 21: train_loss=3.8870, val_loss=6.8829
+2026-03-26 23:14:09,102 | INFO | EPOCH_SUMMARY | epoch=21 | train_loss=3.887030 | val_loss=6.882949 | swav_alpha=0.5 | tau=0.019507 | lr=0.00002500
+2026-03-27 01:37:51,237 | INFO | Epoch 22: train_loss=3.8769, val_loss=6.8889
+2026-03-27 01:37:51,239 | INFO | EPOCH_SUMMARY | epoch=22 | train_loss=3.876940 | val_loss=6.888891 | swav_alpha=0.5 | tau=0.019114 | lr=0.00002014
+2026-03-27 04:01:29,252 | INFO | Epoch 23: train_loss=3.8707, val_loss=6.8925
+2026-03-27 04:01:29,254 | INFO | EPOCH_SUMMARY | epoch=23 | train_loss=3.870703 | val_loss=6.892485 | swav_alpha=0.5 | tau=0.018804 | lr=0.00001569
+2026-03-27 06:25:54,482 | INFO | Epoch 24: train_loss=3.8633, val_loss=6.8952
+2026-03-27 06:25:54,482 | INFO | EPOCH_SUMMARY | epoch=24 | train_loss=3.863253 | val_loss=6.895165 | swav_alpha=0.5 | tau=0.018568 | lr=0.00001170
+2026-03-27 08:51:04,035 | INFO | Epoch 25: train_loss=3.8561, val_loss=6.9062
+2026-03-27 08:51:04,037 | INFO | EPOCH_SUMMARY | epoch=25 | train_loss=3.856123 | val_loss=6.906221 | swav_alpha=0.5 | tau=0.018397 | lr=0.00000823

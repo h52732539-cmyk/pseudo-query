@@ -1,0 +1,7 @@
+*.pt
+*.pyc
+__pycache__/
+data/
+results/
+results_no_temporal/
+external/

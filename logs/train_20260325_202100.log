@@ -1,0 +1,5 @@
+2026-03-25 20:21:00,853 | INFO | Config: configs/default_hybrid.yaml, Scheme: hybrid
+2026-03-25 20:21:00,853 | INFO | Log file: logs/train_20260325_202100.log
+2026-03-25 20:21:00,853 | INFO | Device: cuda
+2026-03-25 20:21:01,226 | INFO | Train pairs: 130260, Val pairs: 9940
+2026-03-25 20:21:05,055 | INFO | Model: HybridPipelineModel, K=512

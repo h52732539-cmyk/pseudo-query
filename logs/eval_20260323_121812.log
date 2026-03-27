@@ -1,0 +1,5 @@
+2026-03-23 12:18:12,876 | INFO | Config: configs/default.yaml
+2026-03-23 12:18:12,877 | INFO | Checkpoint: checkpoints/best_model.pt
+2026-03-23 12:18:12,877 | INFO | Log file: logs/eval_20260323_121812.log
+2026-03-23 12:18:12,877 | INFO | Device: cuda
+2026-03-23 12:18:17,979 | INFO | Inferred num_prototypes=512 from checkpoints/prototypes.pt

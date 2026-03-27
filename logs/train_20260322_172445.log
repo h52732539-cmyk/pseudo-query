@@ -1,0 +1,77 @@
+2026-03-22 17:24:45,551 | INFO | Config: configs/default.yaml
+2026-03-22 17:24:45,552 | INFO | Log file: logs/train_20260322_172445.log
+2026-03-22 17:24:45,552 | INFO | Device: cuda
+2026-03-22 17:24:46,255 | INFO | Train pairs: 130260, Val pairs: 9940
+2026-03-22 17:24:50,758 | INFO | Loaded prototypes from checkpoints/prototypes.pt (method=gmm, K=512)
+2026-03-22 18:25:02,954 | INFO | Epoch 1: train_loss=6.7015, val_loss=4.9662, beta=0.000001
+2026-03-22 18:25:02,955 | INFO | EPOCH_SUMMARY | epoch=1 | train_loss=6.701464 | val_loss=4.966218 | beta=0.000001 | tau=0.069806 | lr=0.00003333
+2026-03-22 18:25:03,008 | INFO |   ✓ Best model saved (val_loss=4.9662)
+2026-03-22 18:51:01,729 | INFO | Epoch 2: train_loss=7.4150, val_loss=5.4157, beta=0.000004
+2026-03-22 18:51:01,729 | INFO | EPOCH_SUMMARY | epoch=2 | train_loss=7.414987 | val_loss=5.415666 | beta=0.000004 | tau=0.069952 | lr=0.00006667
+2026-03-22 19:19:06,054 | INFO | Epoch 3: train_loss=7.9352, val_loss=5.9477, beta=0.000008
+2026-03-22 19:19:06,055 | INFO | EPOCH_SUMMARY | epoch=3 | train_loss=7.935184 | val_loss=5.947750 | beta=0.000008 | tau=0.070194 | lr=0.00010000
+2026-03-22 19:46:11,018 | INFO | Epoch 4: train_loss=7.3240, val_loss=5.0602, beta=0.000011
+2026-03-22 19:46:11,019 | INFO | EPOCH_SUMMARY | epoch=4 | train_loss=7.323985 | val_loss=5.060207 | beta=0.000011 | tau=0.070455 | lr=0.00009966
+2026-03-22 20:12:15,878 | INFO | Epoch 5: train_loss=6.8549, val_loss=5.0254, beta=0.000015
+2026-03-22 20:12:15,878 | INFO | EPOCH_SUMMARY | epoch=5 | train_loss=6.854942 | val_loss=5.025437 | beta=0.000015 | tau=0.070742 | lr=0.00009865
+2026-03-22 20:38:23,570 | INFO | Epoch 6: train_loss=6.7233, val_loss=4.9580, beta=0.000018
+2026-03-22 20:38:23,571 | INFO | EPOCH_SUMMARY | epoch=6 | train_loss=6.723261 | val_loss=4.958001 | beta=0.000018 | tau=0.071125 | lr=0.00009698
+2026-03-22 20:38:23,622 | INFO |   ✓ Best model saved (val_loss=4.9580)
+2026-03-22 21:04:17,389 | INFO | Epoch 7: train_loss=6.6958, val_loss=4.9126, beta=0.000021
+2026-03-22 21:04:17,390 | INFO | EPOCH_SUMMARY | epoch=7 | train_loss=6.695811 | val_loss=4.912587 | beta=0.000021 | tau=0.070984 | lr=0.00009468
+2026-03-22 21:04:17,444 | INFO |   ✓ Best model saved (val_loss=4.9126)
+2026-03-22 21:30:10,763 | INFO | Epoch 8: train_loss=6.5808, val_loss=4.9401, beta=0.000025
+2026-03-22 21:30:10,766 | INFO | EPOCH_SUMMARY | epoch=8 | train_loss=6.580788 | val_loss=4.940090 | beta=0.000025 | tau=0.067340 | lr=0.00009177
+2026-03-22 21:56:03,366 | INFO | Epoch 9: train_loss=6.6924, val_loss=4.9406, beta=0.000028
+2026-03-22 21:56:03,366 | INFO | EPOCH_SUMMARY | epoch=9 | train_loss=6.692364 | val_loss=4.940591 | beta=0.000028 | tau=0.067127 | lr=0.00008830
+2026-03-22 22:21:59,736 | INFO | Epoch 10: train_loss=6.7102, val_loss=4.9418, beta=0.000032
+2026-03-22 22:21:59,737 | INFO | EPOCH_SUMMARY | epoch=10 | train_loss=6.710160 | val_loss=4.941777 | beta=0.000032 | tau=0.066949 | lr=0.00008431
+2026-03-22 22:47:54,850 | INFO | Epoch 11: train_loss=6.7082, val_loss=4.9435, beta=0.000035
+2026-03-22 22:47:54,851 | INFO | EPOCH_SUMMARY | epoch=11 | train_loss=6.708229 | val_loss=4.943461 | beta=0.000035 | tau=0.066711 | lr=0.00007986
+2026-03-22 23:13:48,407 | INFO | Epoch 12: train_loss=6.7148, val_loss=4.9515, beta=0.000039
+2026-03-22 23:13:48,410 | INFO | EPOCH_SUMMARY | epoch=12 | train_loss=6.714837 | val_loss=4.951540 | beta=0.000039 | tau=0.066631 | lr=0.00007500
+2026-03-22 23:39:36,266 | INFO | Epoch 13: train_loss=6.7232, val_loss=4.9615, beta=0.000042
+2026-03-22 23:39:36,267 | INFO | EPOCH_SUMMARY | epoch=13 | train_loss=6.723232 | val_loss=4.961475 | beta=0.000042 | tau=0.066044 | lr=0.00006980
+2026-03-23 00:05:27,736 | INFO | Epoch 14: train_loss=6.7109, val_loss=4.9840, beta=0.000045
+2026-03-23 00:05:27,736 | INFO | EPOCH_SUMMARY | epoch=14 | train_loss=6.710860 | val_loss=4.984031 | beta=0.000045 | tau=0.063691 | lr=0.00006434
+2026-03-23 00:32:16,547 | INFO | Epoch 15: train_loss=6.6647, val_loss=5.0151, beta=0.000049
+2026-03-23 00:32:16,553 | INFO | EPOCH_SUMMARY | epoch=15 | train_loss=6.664713 | val_loss=5.015089 | beta=0.000049 | tau=0.062651 | lr=0.00005868
+2026-03-23 01:00:01,666 | INFO | Epoch 16: train_loss=6.7201, val_loss=4.9817, beta=0.000052
+2026-03-23 01:00:01,678 | INFO | EPOCH_SUMMARY | epoch=16 | train_loss=6.720143 | val_loss=4.981741 | beta=0.000052 | tau=0.061967 | lr=0.00005291
+2026-03-23 01:26:16,314 | INFO | Epoch 17: train_loss=6.7315, val_loss=4.9760, beta=0.000056
+2026-03-23 01:26:16,329 | INFO | EPOCH_SUMMARY | epoch=17 | train_loss=6.731474 | val_loss=4.976016 | beta=0.000056 | tau=0.062055 | lr=0.00004709
+2026-03-23 01:52:07,330 | INFO | Epoch 18: train_loss=6.7335, val_loss=4.9780, beta=0.000059
+2026-03-23 01:52:07,331 | INFO | EPOCH_SUMMARY | epoch=18 | train_loss=6.733548 | val_loss=4.977987 | beta=0.000059 | tau=0.061410 | lr=0.00004132
+2026-03-23 02:17:59,080 | INFO | Epoch 19: train_loss=6.6923, val_loss=4.9328, beta=0.000062
+2026-03-23 02:17:59,081 | INFO | EPOCH_SUMMARY | epoch=19 | train_loss=6.692326 | val_loss=4.932843 | beta=0.000062 | tau=0.060114 | lr=0.00003566
+2026-03-23 02:43:50,013 | INFO | Epoch 20: train_loss=6.6229, val_loss=4.8184, beta=0.000066
+2026-03-23 02:43:50,013 | INFO | EPOCH_SUMMARY | epoch=20 | train_loss=6.622873 | val_loss=4.818355 | beta=0.000066 | tau=0.058404 | lr=0.00003020
+2026-03-23 02:43:50,055 | INFO |   ✓ Best model saved (val_loss=4.8184)
+2026-03-23 03:09:42,115 | INFO | Epoch 21: train_loss=6.4839, val_loss=4.7678, beta=0.000069
+2026-03-23 03:09:42,116 | INFO | EPOCH_SUMMARY | epoch=21 | train_loss=6.483899 | val_loss=4.767769 | beta=0.000069 | tau=0.057568 | lr=0.00002500
+2026-03-23 03:09:42,172 | INFO |   ✓ Best model saved (val_loss=4.7678)
+2026-03-23 03:35:31,660 | INFO | Epoch 22: train_loss=6.4333, val_loss=4.6882, beta=0.000073
+2026-03-23 03:35:31,661 | INFO | EPOCH_SUMMARY | epoch=22 | train_loss=6.433321 | val_loss=4.688198 | beta=0.000073 | tau=0.056736 | lr=0.00002014
+2026-03-23 03:35:31,704 | INFO |   ✓ Best model saved (val_loss=4.6882)
+2026-03-23 04:01:22,497 | INFO | Epoch 23: train_loss=6.3420, val_loss=4.6320, beta=0.000076
+2026-03-23 04:01:22,498 | INFO | EPOCH_SUMMARY | epoch=23 | train_loss=6.342004 | val_loss=4.631997 | beta=0.000076 | tau=0.056287 | lr=0.00001569
+2026-03-23 04:01:22,557 | INFO |   ✓ Best model saved (val_loss=4.6320)
+2026-03-23 04:27:13,617 | INFO | Epoch 24: train_loss=6.2659, val_loss=4.5787, beta=0.000080
+2026-03-23 04:27:13,617 | INFO | EPOCH_SUMMARY | epoch=24 | train_loss=6.265893 | val_loss=4.578718 | beta=0.000080 | tau=0.055869 | lr=0.00001170
+2026-03-23 04:27:13,656 | INFO |   ✓ Best model saved (val_loss=4.5787)
+2026-03-23 04:53:03,715 | INFO | Epoch 25: train_loss=6.2137, val_loss=4.5431, beta=0.000083
+2026-03-23 04:53:03,715 | INFO | EPOCH_SUMMARY | epoch=25 | train_loss=6.213734 | val_loss=4.543060 | beta=0.000083 | tau=0.055520 | lr=0.00000823
+2026-03-23 04:53:03,775 | INFO |   ✓ Best model saved (val_loss=4.5431)
+2026-03-23 05:18:53,739 | INFO | Epoch 26: train_loss=6.1658, val_loss=4.5224, beta=0.000086
+2026-03-23 05:18:53,740 | INFO | EPOCH_SUMMARY | epoch=26 | train_loss=6.165772 | val_loss=4.522395 | beta=0.000086 | tau=0.055255 | lr=0.00000532
+2026-03-23 05:18:53,787 | INFO |   ✓ Best model saved (val_loss=4.5224)
+2026-03-23 05:44:45,058 | INFO | Epoch 27: train_loss=6.1404, val_loss=4.5099, beta=0.000090
+2026-03-23 05:44:45,059 | INFO | EPOCH_SUMMARY | epoch=27 | train_loss=6.140352 | val_loss=4.509904 | beta=0.000090 | tau=0.055093 | lr=0.00000302
+2026-03-23 05:44:45,099 | INFO |   ✓ Best model saved (val_loss=4.5099)
+2026-03-23 06:10:35,900 | INFO | Epoch 28: train_loss=6.1278, val_loss=4.5101, beta=0.000093
+2026-03-23 06:10:35,901 | INFO | EPOCH_SUMMARY | epoch=28 | train_loss=6.127815 | val_loss=4.510080 | beta=0.000093 | tau=0.055005 | lr=0.00000135
+2026-03-23 06:36:27,557 | INFO | Epoch 29: train_loss=6.1273, val_loss=4.5139, beta=0.000097
+2026-03-23 06:36:27,558 | INFO | EPOCH_SUMMARY | epoch=29 | train_loss=6.127305 | val_loss=4.513851 | beta=0.000097 | tau=0.054967 | lr=0.00000034
+2026-03-23 07:02:18,525 | INFO | Epoch 30: train_loss=6.1332, val_loss=4.5215, beta=0.000100
+2026-03-23 07:02:18,552 | INFO | EPOCH_SUMMARY | epoch=30 | train_loss=6.133166 | val_loss=4.521487 | beta=0.000100 | tau=0.054962 | lr=0.00000000
+2026-03-23 07:02:18,590 | INFO | Training finished.

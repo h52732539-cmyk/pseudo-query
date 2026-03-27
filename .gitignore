@@ -5,3 +5,5 @@ data/
 results/
 results_no_temporal/
 external/
+*.json
+.log

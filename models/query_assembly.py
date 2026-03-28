@@ -47,6 +47,6 @@ class QueryAssembly(nn.Module):
 
         # Max-Pooling 沿序列维度 L → s_T
         s_T, _ = A.max(dim=1)  # (B, K)
-        s_T = F.normalize(s_T, p=2, dim=-1)
+        s_T = F.normalize(s_T, p=1, dim=-1)
 
         return s_T, q_tilde

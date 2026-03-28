@@ -57,3 +57,14 @@
 2026-03-27 06:25:54,482 | INFO | EPOCH_SUMMARY | epoch=24 | train_loss=3.863253 | val_loss=6.895165 | swav_alpha=0.5 | tau=0.018568 | lr=0.00001170
 2026-03-27 08:51:04,035 | INFO | Epoch 25: train_loss=3.8561, val_loss=6.9062
 2026-03-27 08:51:04,037 | INFO | EPOCH_SUMMARY | epoch=25 | train_loss=3.856123 | val_loss=6.906221 | swav_alpha=0.5 | tau=0.018397 | lr=0.00000823
+2026-03-27 11:14:59,593 | INFO | Epoch 26: train_loss=3.8515, val_loss=6.9030
+2026-03-27 11:14:59,611 | INFO | EPOCH_SUMMARY | epoch=26 | train_loss=3.851453 | val_loss=6.903024 | swav_alpha=0.5 | tau=0.018283 | lr=0.00000532
+2026-03-27 13:39:40,008 | INFO | Epoch 27: train_loss=3.8461, val_loss=6.9113
+2026-03-27 13:39:40,025 | INFO | EPOCH_SUMMARY | epoch=27 | train_loss=3.846127 | val_loss=6.911263 | swav_alpha=0.5 | tau=0.018218 | lr=0.00000302
+2026-03-27 16:02:49,742 | INFO | Epoch 28: train_loss=3.8440, val_loss=6.9159
+2026-03-27 16:02:49,743 | INFO | EPOCH_SUMMARY | epoch=28 | train_loss=3.844042 | val_loss=6.915917 | swav_alpha=0.5 | tau=0.018180 | lr=0.00000135
+2026-03-27 18:29:17,534 | INFO | Epoch 29: train_loss=3.8425, val_loss=6.9157
+2026-03-27 18:29:17,549 | INFO | EPOCH_SUMMARY | epoch=29 | train_loss=3.842533 | val_loss=6.915737 | swav_alpha=0.5 | tau=0.018165 | lr=0.00000034
+2026-03-27 20:58:39,075 | INFO | Epoch 30: train_loss=3.8393, val_loss=6.9167
+2026-03-27 20:58:39,079 | INFO | EPOCH_SUMMARY | epoch=30 | train_loss=3.839261 | val_loss=6.916679 | swav_alpha=0.5 | tau=0.018164 | lr=0.00000000
+2026-03-27 20:58:39,100 | INFO | Training finished.

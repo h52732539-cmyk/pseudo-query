@@ -19,7 +19,7 @@ encoder:
 
 # ---------- prototype ----------
 prototype:
-  num_prototypes: 512                                # K — 原型数量
+  num_prototypes: 256                                # K — 原型数量
 
 # ---------- model ----------
 model:
@@ -41,7 +41,7 @@ ema:
 # ---------- training ----------
 training:
   seed: 42
-  epochs: 30
+  epochs: 40
   batch_size: 128
   lr: 1.0e-4
   weight_decay: 0.01

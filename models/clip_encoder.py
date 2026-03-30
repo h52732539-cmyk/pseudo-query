@@ -18,8 +18,8 @@ class CLIPTextEncoder(nn.Module):
         super().__init__()
         self.max_length = max_length
         print(f"[CLIPTextEncoder] Loading model: {model_name} (mirror: {os.environ.get('HF_ENDPOINT', 'default')}) ...")
-        self.tokenizer = CLIPTokenizer.from_pretrained(model_name)
-        clip_model = CLIPModel.from_pretrained(model_name)
+        self.tokenizer = CLIPTokenizer.from_pretrained(model_name, local_files_only=True)
+        clip_model = CLIPModel.from_pretrained(model_name, local_files_only=True)
         self.text_model = clip_model.text_model
         self.text_projection = clip_model.text_projection  # (hidden_dim, 512)
         # 冻结所有参数

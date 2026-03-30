@@ -19,7 +19,7 @@ encoder:
 
 # ---------- prototype ----------
 prototype:
-  num_prototypes: 256                                # K — 原型数量
+  num_prototypes: 128                                # K — 原型数量
 
 # ---------- model ----------
 model:

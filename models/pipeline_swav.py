@@ -66,19 +66,21 @@ class SwAVPipelineModel(nn.Module):
         h, mu = self.video_encoder(prototypes, token_features, token_mask)
         return h, mu
 
-    def encode_query(self, query_tokens, query_mask=None):
+    def encode_query(self, query_tokens, query_mask=None, return_raw=False):
         """
-        编码查询 → (s_T, q_tilde)
+        编码查询 → (s_T, q_tilde[, s_T_raw])
         Args:
             query_tokens: (B, L, d)
             query_mask: (B, L)
+            return_raw: bool — 是否额外返回归一化前的 s_T_raw
         Returns:
             s_T: (B, K) — 查询激活向量
             q_tilde: (B, K, d) — 逐原型查询语义
+            s_T_raw: (B, K) — [仅 return_raw=True]
         """
         prototypes = self.prototype_lib()
-        s_T, q_tilde = self.query_assembly(query_tokens, prototypes, self.temperature, query_mask)
-        return s_T, q_tilde
+        return self.query_assembly(query_tokens, prototypes, self.temperature,
+                                   query_mask, return_raw=return_raw)
 
     def forward(self, v1_token_features, v1_token_mask,
                 v2_token_features, v2_token_mask,
@@ -117,9 +119,13 @@ class SwAVPipelineModel(nn.Module):
         _, mu = self.encode_video(token_features, token_mask)
         return mu
 
-    def get_query_repr(self, query_tokens, query_mask=None):
-        """推理用：编码查询 → s_T ∈ R^K"""
-        s_T, _ = self.encode_query(query_tokens, query_mask)
+    def get_query_repr(self, query_tokens, query_mask=None, return_raw=False):
+        """推理用：编码查询 → s_T ∈ R^K [可选返回 s_T_raw]"""
+        result = self.encode_query(query_tokens, query_mask, return_raw=return_raw)
+        if return_raw:
+            s_T, _, s_T_raw = result
+            return s_T, s_T_raw
+        s_T, _ = result
         return s_T
 
     def retrieval_score(self, s_T, mu):

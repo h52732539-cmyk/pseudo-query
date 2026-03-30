@@ -19,16 +19,19 @@ class QueryAssembly(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, query_tokens, prototypes, temperature, query_mask=None):
+    def forward(self, query_tokens, prototypes, temperature, query_mask=None,
+                return_raw=False):
         """
         Args:
             query_tokens: (B, L, d) — 查询文本的 token-level 特征
             prototypes: (K, d) — 原型库
             temperature: scalar — 温度
             query_mask: (B, L) — 1=valid, 0=padding
+            return_raw: bool — 是否额外返回归一化前的 s_T_raw
         Returns:
             s_T: (B, K) — 查询对每个原型的最大激活强度
             q_tilde: (B, K, d) — 逐原型聚合的查询语义向量
+            s_T_raw: (B, K) — [仅 return_raw=True] 归一化前的 max-pool 输出
         """
         # Cross-Attention: query tokens attend to prototypes
         # (B, L, d) x (d, K) → (B, L, K)
@@ -46,7 +49,9 @@ class QueryAssembly(nn.Module):
         q_tilde = F.normalize(q_tilde, p=2, dim=-1)
 
         # Max-Pooling 沿序列维度 L → s_T
-        s_T, _ = A.max(dim=1)  # (B, K)
-        s_T = F.normalize(s_T, p=1, dim=-1)
+        s_T_raw, _ = A.max(dim=1)  # (B, K)
+        s_T = F.normalize(s_T_raw, p=1, dim=-1)
 
+        if return_raw:
+            return s_T, q_tilde, s_T_raw
         return s_T, q_tilde

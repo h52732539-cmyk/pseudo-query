@@ -51,17 +51,28 @@ def encode_all_videos(model, encoder, video_ids, narrations, device, batch_size=
     return torch.cat(all_h, dim=0), torch.cat(all_mu, dim=0)
 
 
-def encode_all_queries(model, encoder, queries, device, batch_size=256):
-    """编码所有查询 → s_T (N, K) + q_tilde (N, K, d)。"""
+def encode_all_queries(model, encoder, queries, device, batch_size=256,
+                       return_raw=False):
+    """编码所有查询 → s_T (N, K) + q_tilde (N, K, d) [+ s_T_raw (N, K)]。"""
     all_s_T, all_q_tilde = [], []
+    all_s_T_raw = [] if return_raw else None
     model.eval()
     with torch.no_grad():
         for i in tqdm(range(0, len(queries), batch_size), desc="Encoding queries"):
             batch_queries = queries[i:i + batch_size]
             query_feats, query_mask = encoder.encode_tokens(batch_queries, device=device)
-            s_T, q_tilde = model.encode_query(query_feats, query_mask, use_ema=False)
+            result = model.encode_query(query_feats, query_mask, use_ema=False,
+                                        return_raw=return_raw)
+            if return_raw:
+                s_T, q_tilde, s_T_raw = result
+                all_s_T_raw.append(s_T_raw.cpu())
+            else:
+                s_T, q_tilde = result
             all_s_T.append(s_T.cpu())
             all_q_tilde.append(q_tilde.cpu())
+    if return_raw:
+        return (torch.cat(all_s_T, dim=0), torch.cat(all_q_tilde, dim=0),
+                torch.cat(all_s_T_raw, dim=0))
     return torch.cat(all_s_T, dim=0), torch.cat(all_q_tilde, dim=0)
 
 

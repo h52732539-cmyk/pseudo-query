@@ -125,6 +125,89 @@ def compute_activation_entropy(s_T):
 
 
 # ============================================================
+# 正则化前 s_T 统计
+# ============================================================
+
+def compute_raw_st_statistics(s_T_raw):
+    """
+    计算正则化前 s_T_raw 的完整统计信息，用于诊断 max-pool 饱和/均匀性问题。
+
+    Args:
+        s_T_raw: (N, K) — L1 归一化前的 max-pool 输出
+    Returns:
+        dict — 各项统计指标
+    """
+    N, K = s_T_raw.shape
+    flat = s_T_raw.numpy()
+
+    # 全局统计
+    global_stats = {
+        "mean": round(float(flat.mean()), 6),
+        "std": round(float(flat.std()), 6),
+        "min": round(float(flat.min()), 6),
+        "max": round(float(flat.max()), 6),
+        "median": round(float(np.median(flat)), 6),
+    }
+
+    # 每 query 统计（先在 K 维度聚合，再在 N 维度取均值/中位数）
+    per_query_max = flat.max(axis=1)    # (N,)
+    per_query_min = flat.min(axis=1)    # (N,)
+    per_query_mean = flat.mean(axis=1)  # (N,)
+    per_query_std = flat.std(axis=1)    # (N,)
+    per_query_range = per_query_max - per_query_min
+
+    per_query_stats = {
+        "max_of_max": round(float(per_query_max.max()), 6),
+        "min_of_max": round(float(per_query_max.min()), 6),
+        "mean_of_max": round(float(per_query_max.mean()), 6),
+        "std_of_max": round(float(per_query_max.std()), 6),
+        "mean_of_min": round(float(per_query_min.mean()), 6),
+        "mean_of_mean": round(float(per_query_mean.mean()), 6),
+        "mean_of_std": round(float(per_query_std.mean()), 6),
+        "mean_of_range": round(float(per_query_range.mean()), 6),
+    }
+
+    # 稀疏度：每 query 中 s_T_raw < threshold 的原型占比
+    thresholds = [0.001, 0.01, 0.1]
+    sparsity = {}
+    for thr in thresholds:
+        ratio_per_query = (flat < thr).sum(axis=1) / K  # (N,)
+        sparsity[f"<{thr}"] = {
+            "mean": round(float(ratio_per_query.mean()), 4),
+            "median": round(float(np.median(ratio_per_query)), 4),
+        }
+
+    # top-k 集中度：top-k 值均值 vs 剩余原型均值的比值
+    sorted_vals = np.sort(flat, axis=1)[:, ::-1]  # (N, K) descending
+    topk_ratios = {}
+    for k in [1, 5, 10]:
+        topk_mean = sorted_vals[:, :k].mean(axis=1)       # (N,)
+        rest_mean = sorted_vals[:, k:].mean(axis=1)        # (N,)
+        ratio = topk_mean / np.maximum(rest_mean, 1e-10)   # (N,)
+        topk_ratios[f"top{k}_vs_rest"] = {
+            "mean_ratio": round(float(ratio.mean()), 4),
+            "median_ratio": round(float(np.median(ratio)), 4),
+            "topk_mean": round(float(topk_mean.mean()), 6),
+            "rest_mean": round(float(rest_mean.mean()), 6),
+        }
+
+    # 分位数：per-query max 值的分布
+    percentiles = [25, 50, 75, 90, 99]
+    pctl_of_max = {
+        f"p{p}": round(float(np.percentile(per_query_max, p)), 6)
+        for p in percentiles
+    }
+
+    return {
+        "global": global_stats,
+        "per_query": per_query_stats,
+        "sparsity": sparsity,
+        "topk_concentration": topk_ratios,
+        "percentiles_of_per_query_max": pctl_of_max,
+    }
+
+
+# ============================================================
 # 与原型中心的对齐度
 # ============================================================
 
@@ -163,9 +246,10 @@ RANK_BUCKETS = [
 
 
 def bucket_statistics(ranks, scores, query_vid_map, video_ids,
-                      all_mu, all_s_T, cluster_ids, cluster_sizes):
+                      all_mu, all_s_T, cluster_ids, cluster_sizes,
+                      all_s_T_raw=None):
     """
-    按rank分桶计算聚合统计。
+    按rank分桶计算聚合统计。可选包含正则化前 s_T_raw 的统计。
     """
     vid_to_idx = {v: i for i, v in enumerate(video_ids)}
     N_q = len(ranks)
@@ -173,6 +257,9 @@ def bucket_statistics(ranks, scores, query_vid_map, video_ids,
 
     # query激活entropy
     q_entropy = compute_activation_entropy(all_s_T).numpy()
+    has_raw = all_s_T_raw is not None
+    if has_raw:
+        raw_np = all_s_T_raw.numpy()  # (N_q, K)
 
     bucket_stats = []
     for name, lo, hi in RANK_BUCKETS:
@@ -211,7 +298,7 @@ def bucket_statistics(ranks, scores, query_vid_map, video_ids,
             gt_cluster_sizes_list.append(cluster_sizes.get(gt_cluster, 0))
             entropies.append(float(q_entropy[q_idx]))
 
-        bucket_stats.append({
+        bucket_item = {
             "bucket": name,
             "count": count,
             "ratio": round(count / N_q * 100, 2),
@@ -225,7 +312,29 @@ def bucket_statistics(ranks, scores, query_vid_map, video_ids,
             "gt_cluster_size_mean": round(float(np.mean(gt_cluster_sizes_list)), 1),
             "query_entropy_mean": round(float(np.mean(entropies)), 4),
             "query_entropy_median": round(float(np.median(entropies)), 4),
-        })
+        }
+
+        # 正则化前 s_T 统计（按桶）
+        if has_raw:
+            bucket_raw = raw_np[indices]  # (count, K)
+            per_q_max = bucket_raw.max(axis=1)
+            per_q_std = bucket_raw.std(axis=1)
+            sparsity_001 = (bucket_raw < 0.01).sum(axis=1) / K
+            sorted_desc = np.sort(bucket_raw, axis=1)[:, ::-1]
+            top5_mean = sorted_desc[:, :5].mean(axis=1)
+            rest_mean = sorted_desc[:, 5:].mean(axis=1)
+            top5_ratio = top5_mean / np.maximum(rest_mean, 1e-10)
+            bucket_item.update({
+                "raw_mean": round(float(bucket_raw.mean()), 6),
+                "raw_std": round(float(bucket_raw.std()), 6),
+                "raw_per_query_max_mean": round(float(per_q_max.mean()), 6),
+                "raw_per_query_max_std": round(float(per_q_max.std()), 6),
+                "raw_per_query_std_mean": round(float(per_q_std.mean()), 6),
+                "raw_sparsity_001_mean": round(float(sparsity_001.mean()), 4),
+                "raw_top5_ratio_mean": round(float(top5_ratio.mean()), 4),
+            })
+
+        bucket_stats.append(bucket_item)
 
     return bucket_stats
 
@@ -466,10 +575,12 @@ def main():
     logger.info("=" * 60)
 
     all_h, all_mu = encode_all_videos(model, encoder, video_ids, narrations, device)
-    all_s_T, all_q_tilde = encode_all_queries(model, encoder, queries, device)
+    all_s_T, all_q_tilde, all_s_T_raw = encode_all_queries(
+        model, encoder, queries, device, return_raw=True)
 
     logger.info(f"  Video h: {all_h.shape}, Video μ: {all_mu.shape}")
     logger.info(f"  Query s_T: {all_s_T.shape}, Query q_tilde: {all_q_tilde.shape}")
+    logger.info(f"  Query s_T_raw: {all_s_T_raw.shape}")
 
     # ---- 评分 ----
     logger.info("=" * 60)
@@ -502,6 +613,35 @@ def main():
     logger.info(f"  Entropy threshold: {entropy_threshold:.4f} (75th pctl)")
     logger.info(f"  Crowd threshold: {crowd_threshold}")
 
+    # ---- Part 0: 正则化前 s_T 统计 ----
+    logger.info("=" * 60)
+    logger.info("Part 0: 正则化前 s_T 统计 (诊断 max-pool 饱和/均匀性)")
+    logger.info("=" * 60)
+
+    raw_st_stats = compute_raw_st_statistics(all_s_T_raw)
+    g = raw_st_stats["global"]
+    logger.info(f"  [全局] mean={g['mean']}, std={g['std']}, "
+                f"min={g['min']}, max={g['max']}, median={g['median']}")
+
+    pq = raw_st_stats["per_query"]
+    logger.info(f"  [每query] max均值={pq['mean_of_max']}, max标准差={pq['std_of_max']}, "
+                f"max范围=[{pq['min_of_max']}, {pq['max_of_max']}]")
+    logger.info(f"  [每query] mean均值={pq['mean_of_mean']}, std均值={pq['mean_of_std']}, "
+                f"range均值={pq['mean_of_range']}")
+
+    sp = raw_st_stats["sparsity"]
+    sp_strs = ", ".join(f"{k}: {v['mean']:.4f}" for k, v in sp.items())
+    logger.info(f"  [稀疏度] 各阈值下近零原型占比均值: {sp_strs}")
+
+    tk = raw_st_stats["topk_concentration"]
+    for k_name, v in tk.items():
+        logger.info(f"  [集中度] {k_name}: ratio={v['mean_ratio']:.4f}, "
+                    f"topk_mean={v['topk_mean']}, rest_mean={v['rest_mean']}")
+
+    pctl = raw_st_stats["percentiles_of_per_query_max"]
+    pctl_str = ", ".join(f"{k}={v}" for k, v in pctl.items())
+    logger.info(f"  [分位数] per-query max: {pctl_str}")
+
     # ---- Part 1: 按rank分桶统计 ----
     logger.info("=" * 60)
     logger.info("Part 1: 按rank分桶统计")
@@ -509,22 +649,31 @@ def main():
 
     bucket_stats = bucket_statistics(
         ranks, scores, query_vid_map, video_ids,
-        all_mu, all_s_T, cluster_ids, cluster_sizes)
+        all_mu, all_s_T, cluster_ids, cluster_sizes,
+        all_s_T_raw=all_s_T_raw)
 
     header = (f"  {'桶':<16} {'数量':>6} {'占比%':>6} {'同聚类%':>8} "
-              f"{'GT分':>8} {'Pred分':>8} {'Gap':>8} {'聚类大小':>8} {'Entropy':>8}")
+              f"{'GT分':>8} {'Pred分':>8} {'Gap':>8} {'聚类大小':>8} {'Entropy':>8}"
+              f" │ {'raw_max':>8} {'raw_std':>8} {'稀疏':>6} {'top5比':>7}")
     logger.info(header)
-    logger.info(f"  {'─' * 90}")
+    logger.info(f"  {'─' * 115}")
     for b in bucket_stats:
         if b["count"] == 0:
             logger.info(f"  {b['bucket']:<16} {0:>6} {0:>6.1f}")
             continue
+        raw_part = ""
+        if "raw_per_query_max_mean" in b:
+            raw_part = (f" │ {b['raw_per_query_max_mean']:>8.4f} "
+                       f"{b['raw_per_query_std_mean']:>8.6f} "
+                       f"{b['raw_sparsity_001_mean']:>6.3f} "
+                       f"{b['raw_top5_ratio_mean']:>7.3f}")
         logger.info(
             f"  {b['bucket']:<16} {b['count']:>6} {b['ratio']:>6.1f} "
             f"{b['same_cluster_ratio']:>8.1f} "
             f"{b['gt_score_mean']:>8.3f} {b['pred_score_mean']:>8.3f} "
             f"{b['score_gap_mean']:>8.3f} "
-            f"{b['gt_cluster_size_mean']:>8.1f} {b['query_entropy_mean']:>8.3f}")
+            f"{b['gt_cluster_size_mean']:>8.1f} {b['query_entropy_mean']:>8.3f}"
+            f"{raw_part}")
 
     # ---- Part 2: 失效模式分析 ----
     logger.info("=" * 60)
@@ -578,6 +727,7 @@ def main():
             "crowd_threshold": crowd_threshold,
         },
         "metrics": metrics,
+        "raw_st_statistics": raw_st_stats,
         "bucket_statistics": bucket_stats,
         "failure_mode_distribution": mode_dist,
         "failure_tag_distribution": tag_dist,

@@ -71,15 +71,15 @@ class HybridPipelineModel(nn.Module):
         h, mu = self.video_encoder(prototypes, token_features, token_mask)
         return h, mu
 
-    def encode_query(self, query_tokens, query_mask=None, use_ema: bool = False):
+    def encode_query(self, query_tokens, query_mask=None, use_ema: bool = False,
+                     return_raw: bool = False):
         """
-        编码查询 → (s_T, q_tilde)
+        编码查询 → (s_T, q_tilde[, s_T_raw])
         梯度原型用于 QueryAssembly 以保证梯度回传到原型参数。
         """
-        # 用梯度版本的原型，确保梯度可以流回 prototype_lib.prototypes
         prototypes = self.prototype_lib(use_ema=use_ema)
-        s_T, q_tilde = self.query_assembly(query_tokens, prototypes, self.temperature, query_mask)
-        return s_T, q_tilde
+        return self.query_assembly(query_tokens, prototypes, self.temperature,
+                                   query_mask, return_raw=return_raw)
 
     def forward(self, v1_token_features, v1_token_mask,
                 v2_token_features, v2_token_mask,
@@ -132,9 +132,14 @@ class HybridPipelineModel(nn.Module):
         _, mu = self.encode_video(token_features, token_mask, use_ema=False)
         return mu
 
-    def get_query_repr(self, query_tokens, query_mask=None):
-        """推理用：编码查询 → s_T ∈ R^K"""
-        s_T, _ = self.encode_query(query_tokens, query_mask, use_ema=False)
+    def get_query_repr(self, query_tokens, query_mask=None, return_raw=False):
+        """推理用：编码查询 → s_T ∈ R^K [可选返回 s_T_raw]"""
+        result = self.encode_query(query_tokens, query_mask, use_ema=False,
+                                   return_raw=return_raw)
+        if return_raw:
+            s_T, _, s_T_raw = result
+            return s_T, s_T_raw
+        s_T, _ = result
         return s_T
 
     def retrieval_score(self, s_T, mu):

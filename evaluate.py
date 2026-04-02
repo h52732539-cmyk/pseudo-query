@@ -1,9 +1,9 @@
 """
-评估脚本：Text→Video Retrieval — R@1, R@5, R@10, MdR, MnR。
-支持方案B (SwAV) 和方案C (Hybrid)。
+评估脚本：两阶段 Text→Video Retrieval — R@1, R@5, R@10, MdR, MnR。
+流程：预增强 narration → 逐查询核过滤 → Sinkhorn 聚类 → 粗筛 → 精排。
 
 用法:
-    python evaluate.py [--config configs/default.yaml] [--checkpoint checkpoints/best_model.pt]
+    python evaluate.py [--config configs/default_pq.yaml] [--checkpoint checkpoints/best_model.pt]
 """
 import argparse
 import json
@@ -11,6 +11,7 @@ import logging
 from datetime import datetime
 import yaml
 import torch
+import torch.nn.functional as F
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
@@ -18,52 +19,22 @@ from collections import defaultdict
 
 from data.preprocess import load_narrations, load_gt_annotations, get_split_video_ids
 from models.clip_encoder import CLIPTextEncoder
-from models.scoring import cosine_retrieval_score
-from train import encode_video_captions, build_model
+from models.nucleus_filter import NucleusFilter
+from models.pipeline_pq import PseudoQueryPipeline
+from models.prototype_builder import sinkhorn_cluster, build_inverted_index
 
 logger = logging.getLogger("eval")
 
 
-def build_video_representations(model, encoder, video_ids, narrations, device, batch_size=32):
-    """
-    离线编码所有视频 → μ ∈ R^K 表示。
-    Returns:
-        all_mu: (N_videos, K)
-    """
-    all_mu = []
-    model.eval()
-    with torch.no_grad():
-        for i in tqdm(range(0, len(video_ids), batch_size), desc="Encoding videos"):
-            batch_vids = video_ids[i : i + batch_size]
-            captions_list = [narrations[vid] for vid in batch_vids]
-            video_feats, video_mask = encode_video_captions(encoder, captions_list, device)
-            mu = model.get_video_repr(video_feats, video_mask)
-            all_mu.append(mu.cpu())
-
-    return torch.cat(all_mu, dim=0)
-
-
-def build_query_representations(model, encoder, queries, device, batch_size=256):
-    """
-    离线编码所有查询 → s_T ∈ R^K 表示。
-    Returns:
-        all_s_T: (N_queries, K)
-    """
-    all_s_T = []
-    model.eval()
-    with torch.no_grad():
-        for i in tqdm(range(0, len(queries), batch_size), desc="Encoding queries"):
-            batch_queries = queries[i : i + batch_size]
-            query_feats, query_mask = encoder.encode_tokens(batch_queries, device=device)
-            s_T = model.get_query_repr(query_feats, query_mask)
-            all_s_T.append(s_T.cpu())
-
-    return torch.cat(all_s_T, dim=0)
-
+# ─────────────────────── 指标计算 ───────────────────────
 
 def compute_metrics(scores, query_video_map, video_ids):
     """
     计算 R@1, R@5, R@10, MdR, MnR。
+    Args:
+        scores: (N_queries, N_videos) tensor 或 ndarray
+        query_video_map: list — 第 i 个 query 对应的 gt video_id
+        video_ids: list — 全部候选 video_id（与 scores 列对应）
     """
     vid_to_idx = {v: i for i, v in enumerate(video_ids)}
     N_q = scores.shape[0]
@@ -72,7 +43,7 @@ def compute_metrics(scores, query_video_map, video_ids):
     for q_idx in range(N_q):
         gt_vid = query_video_map[q_idx]
         gt_idx = vid_to_idx[gt_vid]
-        score_row = scores[q_idx]
+        score_row = scores[q_idx] if isinstance(scores, torch.Tensor) else torch.tensor(scores[q_idx])
         sorted_indices = torch.argsort(score_row, descending=True)
         rank = (sorted_indices == gt_idx).nonzero(as_tuple=True)[0].item() + 1
         ranks.append(rank)
@@ -93,75 +64,270 @@ def compute_metrics(scores, query_video_map, video_ids):
     }, ranks
 
 
-def print_prototype_statistics(all_mu, video_ids):
-    """打印测试集视频的原型激活统计信息。"""
-    N, K = all_mu.shape
-    cluster_assignment = torch.argmax(all_mu, dim=1).numpy()
+# ─────────────── 离线预计算：增强所有 narration ─────────────────
 
-    cluster_counts = defaultdict(int)
-    for c in cluster_assignment:
-        cluster_counts[int(c)] += 1
+@torch.no_grad()
+def precompute_enhanced_narrations(
+    encoder, nucleus_filter, video_ids, narrations, frame_feat_dir, device,
+    max_narrs=64, num_frames=12, feat_dim=512,
+):
+    """
+    一次性对所有视频执行 Co-Attention + Temporal 增强。
+    Returns:
+        all_narr_sent: dict {vid: (N_i, d)} — 增强后 narration 句子 embedding
+        all_narr_tok:  dict {vid: (token_feats, token_mask)} — 原始 narration token（精排用）
+        narr_metadata: [(vid, narr_local_idx), ...] — 全局 narration 索引 → 视频映射
+        all_enhanced_flat: (N_total, d) — 增强后 narration embeddings 展平
+    """
+    all_narr_sent = {}
+    all_narr_tok = {}
+    narr_metadata = []
+    enhanced_flat = []
 
-    non_empty = len(cluster_counts)
-    empty = K - non_empty
-    counts = np.array(list(cluster_counts.values()))
+    frame_feat_path = Path(frame_feat_dir)
 
+    for vid in tqdm(video_ids, desc="预增强 narrations"):
+        captions = narrations.get(vid, [])
+        if not captions:
+            continue
+        captions = captions[:max_narrs]
+
+        # 帧特征
+        pt_file = frame_feat_path / f"{vid}.pt"
+        if pt_file.exists():
+            frame_feats = torch.load(pt_file, map_location=device, weights_only=True)
+        else:
+            frame_feats = torch.randn(num_frames, feat_dim, device=device)
+            frame_feats = F.normalize(frame_feats, p=2, dim=-1)
+        frame_feats = frame_feats.unsqueeze(0)  # (1, K, d)
+
+        # CLIP 编码 narrations
+        narr_tok, narr_tok_mask = encoder.encode_tokens(captions, device=device)  # (N_i, L, d), (N_i, L)
+        narr_sent = encoder.encode_sentence(captions, device=device)  # (N_i, d)
+        N_i = narr_sent.shape[0]
+
+        # 扩展帧特征以匹配 batch 维度 = 1
+        narr_sent_batch = narr_sent.unsqueeze(0)  # (1, N_i, d)
+        narr_mask = torch.ones(1, N_i, device=device)
+
+        # Co-Attention + Temporal 增强
+        _, enhanced_n = nucleus_filter.enhance_features(frame_feats, narr_sent_batch, narr_mask)
+        enhanced_n = enhanced_n.squeeze(0)  # (N_i, d)
+
+        all_narr_sent[vid] = enhanced_n.cpu()
+
+        # 缓存原始 token 特征（精排用）
+        all_narr_tok[vid] = (narr_tok.cpu(), narr_tok_mask.cpu())
+
+        for local_idx in range(N_i):
+            narr_metadata.append((vid, local_idx))
+            enhanced_flat.append(enhanced_n[local_idx])
+
+    all_enhanced_flat = torch.stack(enhanced_flat, dim=0)  # (N_total, d)
+    return all_narr_sent, all_narr_tok, narr_metadata, all_enhanced_flat
+
+
+# ─────────────── 逐查询核过滤 + 聚类 + 粗筛 + 精排 ─────────────────
+
+@torch.no_grad()
+def two_stage_retrieve(
+    query_text, encoder, nucleus_filter, model,
+    all_enhanced_flat, narr_metadata, all_narr_sent, all_narr_tok,
+    video_ids, device, cfg,
+):
+    """
+    单条查询的两阶段检索。
+    Returns:
+        video_scores: dict {vid: float} — 所有候选视频的最终分数
+    """
+    proto_cfg = cfg["prototype"]
+    retr_cfg = cfg["retrieval"]
+    nf_cfg = cfg["nucleus_filter"]
+
+    # 编码查询
+    q_sent = encoder.encode_sentence([query_text], device=device)  # (1, d)
+    q_tok, q_mask = encoder.encode_tokens([query_text], device=device)  # (1, L, d), (1, L)
+
+    # 核过滤：query vs 增强后所有 narrations
+    N_total = all_enhanced_flat.shape[0]
+    enhanced_on_device = all_enhanced_flat.to(device)
+
+    # 计算 query-narration 相似度
+    q_norm = F.normalize(q_sent, p=2, dim=-1)  # (1, d)
+    n_norm = F.normalize(enhanced_on_device, p=2, dim=-1)  # (N_total, d)
+    sim = (q_norm @ n_norm.T).squeeze(0)  # (N_total,)
+    weights = F.softmax(sim, dim=0)
+
+    # Nucleus 硬截断
+    selected_indices, selected_weights = nucleus_filter.nucleus_select(
+        weights.unsqueeze(0), threshold_p=nf_cfg["inference_threshold"]
+    )
+    sel_idx = selected_indices[0]  # (K_sel,)
+    sel_embs = enhanced_on_device[sel_idx]  # (K_sel, d)
+
+    # 收集选中 narrations 对应的视频
+    sel_metadata = [narr_metadata[i.item()] for i in sel_idx]
+
+    # Sinkhorn-Knopp 聚类
+    K = min(proto_cfg["num_prototypes"], sel_embs.shape[0])
+    if K < 2:
+        # 太少 narrations，直接暴力匹配
+        candidate_vids = list(set(vid for vid, _ in sel_metadata))
+    else:
+        prototypes, assignments = sinkhorn_cluster(
+            sel_embs, K,
+            eps=proto_cfg["sinkhorn_eps"],
+            niters=proto_cfg["sinkhorn_iters"],
+            n_rounds=proto_cfg["cluster_rounds"],
+        )
+        inverted_index, _ = build_inverted_index(assignments, sel_metadata)
+
+        # 粗筛：query vs 原型 → top-M → 候选视频
+        coarse_sim = (q_norm @ prototypes.T).squeeze(0)  # (K,)
+        top_m = min(retr_cfg["coarse_top_m"], K)
+        _, top_proto_idx = coarse_sim.topk(top_m)
+
+        candidate_vids = set()
+        for idx in top_proto_idx.tolist():
+            if idx in inverted_index:
+                candidate_vids.update(inverted_index[idx])
+        candidate_vids = list(candidate_vids)[:retr_cfg["fine_max_candidates"]]
+
+    if not candidate_vids:
+        return {}
+
+    # 精排：query tokens × 候选视频 narration tokens
+    video_scores = {}
+    temperature = model.temperature.item()
+
+    for vid in candidate_vids:
+        # 粗筛分数：adapted query vs 该视频 narrations 的均值
+        if vid in all_narr_sent:
+            vid_narr_embs = all_narr_sent[vid].to(device)  # (N_v, d)
+            vid_centroid = F.normalize(vid_narr_embs.mean(dim=0, keepdim=True), p=2, dim=-1)
+        else:
+            continue
+
+        adapted_q = model.adapt_query(q_sent)  # (1, d)
+        coarse_s = (adapted_q @ vid_centroid.T).item() / temperature
+
+        # 精排分数：token-level cross-attention
+        if vid in all_narr_tok:
+            narr_tok_feats, narr_tok_mask = all_narr_tok[vid]
+            narr_tok_feats = narr_tok_feats.to(device)
+            narr_tok_mask = narr_tok_mask.to(device)
+
+            # 拼接所有 narration tokens
+            N_narr, L_n, d = narr_tok_feats.shape
+            flat_tok = narr_tok_feats.reshape(1, N_narr * L_n, d)
+            flat_mask = narr_tok_mask.reshape(1, N_narr * L_n)
+
+            # Truncate
+            max_len = cfg.get("training", {}).get("max_narr_tokens", 512)
+            if flat_tok.shape[1] > max_len:
+                flat_tok = flat_tok[:, :max_len, :]
+                flat_mask = flat_mask[:, :max_len]
+
+            fine_s = model.rerank(q_tok, q_mask, flat_tok, flat_mask).item()
+        else:
+            fine_s = 0.0
+
+        video_scores[vid] = coarse_s + cfg["model"]["fine_loss_weight"] * fine_s
+
+    return video_scores
+
+
+# ─────────────── 评估入口 ─────────────────
+
+@torch.no_grad()
+def evaluate_two_stage(
+    encoder, nucleus_filter, model, test_video_ids, gt, narrations,
+    frame_feat_dir, device, cfg, log_dir, tag="full",
+):
+    """两阶段评估主流程。"""
+    N_test = len(test_video_ids)
+    logger.info(f"\n=== Two-Stage Evaluation [{tag}] ({N_test} videos) ===")
+
+    # Step 1: 离线预增强所有 narrations
+    logger.info("Step 1: 预增强 narrations (Co-Attention + Temporal) ...")
+    all_narr_sent, all_narr_tok, narr_metadata, all_enhanced_flat = \
+        precompute_enhanced_narrations(
+            encoder, nucleus_filter, test_video_ids, narrations,
+            frame_feat_dir, device,
+            feat_dim=cfg["encoder"]["feature_dim"],
+        )
+    logger.info(f"  增强完毕: {len(narr_metadata)} 条 narrations, {len(all_narr_sent)} 个视频")
+
+    # 打印核过滤统计
+    log_narr_statistics(all_narr_sent, test_video_ids)
+
+    # 构建查询列表
+    queries = []
+    query_vid_map = []
+    for vid in test_video_ids:
+        if vid in gt:
+            for cap in gt[vid]:
+                queries.append(cap)
+                query_vid_map.append(vid)
+    logger.info(f"  查询总数: {len(queries)}")
+
+    # Step 2: 逐查询两阶段检索
+    logger.info("Step 2: 逐查询核过滤 → 聚类 → 粗筛 → 精排 ...")
+    all_scores = np.zeros((len(queries), N_test))
+    vid_to_col = {v: i for i, v in enumerate(test_video_ids)}
+
+    for q_idx, query_text in enumerate(tqdm(queries, desc="检索")):
+        video_scores = two_stage_retrieve(
+            query_text, encoder, nucleus_filter, model,
+            all_enhanced_flat, narr_metadata, all_narr_sent, all_narr_tok,
+            test_video_ids, device, cfg,
+        )
+        for vid, score in video_scores.items():
+            if vid in vid_to_col:
+                all_scores[q_idx, vid_to_col[vid]] = score
+
+    # Step 3: 计算指标
+    metrics, ranks = compute_metrics(
+        torch.tensor(all_scores), query_vid_map, test_video_ids
+    )
+
+    # 保存分析
+    analyze_results(all_scores, queries, query_vid_map, test_video_ids,
+                    ranks, cfg, log_dir, tag)
+
+    return metrics
+
+
+def log_narr_statistics(all_narr_sent, video_ids):
+    """打印增强后 narration 统计信息。"""
+    narr_counts = []
+    for vid in video_ids:
+        if vid in all_narr_sent:
+            narr_counts.append(all_narr_sent[vid].shape[0])
+        else:
+            narr_counts.append(0)
+    counts = np.array(narr_counts)
     logger.info("=" * 60)
-    logger.info("原型聚类统计信息")
+    logger.info("增强后 Narration 统计")
     logger.info("=" * 60)
-    logger.info(f"  原型总数 K = {K}")
-    logger.info(f"  视频总数 N = {N}")
-    logger.info(f"  非空聚类数 = {non_empty}")
-    logger.info(f"  空聚类数   = {empty}")
-    logger.info(f"  各聚类视频数分布: min={counts.min()}, max={counts.max()}, "
-                f"mean={counts.mean():.2f}, median={np.median(counts):.1f}, std={counts.std():.2f}")
-
-    sorted_clusters = sorted(cluster_counts.items(), key=lambda x: x[1], reverse=True)
-    logger.info(f"  Top-10 最大聚类: {[(c, n) for c, n in sorted_clusters[:10]]}")
-    logger.info(f"  Top-10 最小非空聚类: {[(c, n) for c, n in sorted_clusters[-10:]]}")
-
-    mu_max_vals = all_mu.max(dim=1).values
-    logger.info(f"  归属聚类维度的 μ 统计: mean={mu_max_vals.mean():.4f}, std={mu_max_vals.std():.4f}")
-    logger.info(f"  全局 μ 统计: mean={all_mu.mean():.4f}, std={all_mu.std():.4f}, "
-                f"min={all_mu.min():.4f}, max={all_mu.max():.4f}")
+    logger.info(f"  视频总数: {len(video_ids)}, 有 narration 的: {(counts > 0).sum()}")
+    if counts.sum() > 0:
+        logger.info(f"  每视频 narration 数: min={counts.min()}, max={counts.max()}, "
+                     f"mean={counts.mean():.2f}, median={np.median(counts):.1f}")
     logger.info("=" * 60)
 
-    return cluster_assignment
 
-
-def analyze_results(scores, all_mu, queries, query_vid_map,
-                    video_ids, ranks, cfg, log_dir, tag="full"):
-    """对评估结果进行详细分析，保存为 JSON。"""
+def analyze_results(scores, queries, query_vid_map, video_ids, ranks, cfg, log_dir, tag):
+    """保存评估分析结果为 JSON。"""
     vid_to_idx = {v: i for i, v in enumerate(video_ids)}
-    N_videos, K = all_mu.shape
-    cluster_assignment = torch.argmax(all_mu, dim=1).numpy()
 
     details = []
-    same_cluster_count = 0
-    rank1_same_cluster_count = 0
-    ranks_same = []
-    ranks_diff = []
-
     for q_idx in range(len(queries)):
         gt_vid = query_vid_map[q_idx]
-        gt_idx = vid_to_idx[gt_vid]
-
-        pred_idx = torch.argsort(scores[q_idx], descending=True)[0].item()
+        score_row = scores[q_idx] if isinstance(scores, np.ndarray) else scores[q_idx].numpy()
+        pred_idx = int(np.argmax(score_row))
         pred_vid = video_ids[pred_idx]
-
-        gt_cluster = int(cluster_assignment[gt_idx])
-        pred_cluster = int(cluster_assignment[pred_idx])
-        same_cluster = (gt_cluster == pred_cluster)
-
         rank = int(ranks[q_idx])
-
-        if same_cluster:
-            same_cluster_count += 1
-            ranks_same.append(rank)
-            if rank == 1:
-                rank1_same_cluster_count += 1
-        else:
-            ranks_diff.append(rank)
 
         details.append({
             "query_idx": q_idx,
@@ -169,29 +335,24 @@ def analyze_results(scores, all_mu, queries, query_vid_map,
             "gt_video_id": gt_vid,
             "predicted_video_id": pred_vid,
             "rank": rank,
-            "gt_cluster": gt_cluster,
-            "pred_cluster": pred_cluster,
-            "same_cluster": same_cluster,
         })
 
-    total = len(queries)
     summary = {
-        "total_queries": total,
-        "same_cluster_ratio": round(same_cluster_count / max(total, 1), 4),
-        "same_cluster_count": same_cluster_count,
-        "diff_cluster_count": total - same_cluster_count,
-        "rank1_same_cluster_count": rank1_same_cluster_count,
-        "rank1_same_cluster_ratio": round(rank1_same_cluster_count / max(same_cluster_count, 1), 4),
-        "avg_rank_same_cluster": round(float(np.mean(ranks_same)), 4) if ranks_same else None,
-        "avg_rank_diff_cluster": round(float(np.mean(ranks_diff)), 4) if ranks_diff else None,
+        "total_queries": len(queries),
+        "total_videos": len(video_ids),
+        "R@1": float((ranks <= 1).mean() * 100),
+        "R@5": float((ranks <= 5).mean() * 100),
+        "R@10": float((ranks <= 10).mean() * 100),
+        "MdR": float(np.median(ranks)),
+        "MnR": float(np.mean(ranks)),
     }
 
     result = {
         "config": {
-            "num_prototypes": K,
+            "num_prototypes": cfg["prototype"]["num_prototypes"],
+            "nucleus_threshold": cfg["nucleus_filter"]["inference_threshold"],
             "test_mode": tag,
-            "num_videos": N_videos,
-            "scheme": cfg.get("scheme", "swav"),
+            "scheme": "pq",
         },
         "summary": summary,
         "details": details,
@@ -203,79 +364,23 @@ def analyze_results(scores, all_mu, queries, query_vid_map,
         json.dump(result, f, ensure_ascii=False, indent=2)
 
     logger.info(f"分析结果已保存到: {json_path}")
-    logger.info(f"分析摘要: {json.dumps(summary, ensure_ascii=False)}")
 
 
-def evaluate_full_test(model, encoder, test_ids, gt, narrations, device, cfg, log_dir):
-    """全量测试集评估（每个GT caption作为独立查询）"""
-    logger.info(f"\n=== Full Test Evaluation ({len(test_ids)} videos) ===")
-
-    all_mu = build_video_representations(model, encoder, test_ids, narrations, device)
-    print_prototype_statistics(all_mu, test_ids)
-
-    queries = []
-    query_vid_map = []
-    for vid in test_ids:
-        if vid in gt:
-            for cap in gt[vid]:
-                queries.append(cap)
-                query_vid_map.append(vid)
-
-    logger.info(f"Total queries: {len(queries)}")
-    all_s_T = build_query_representations(model, encoder, queries, device)
-
-    temperature = model.temperature.item()
-    scores = cosine_retrieval_score(all_s_T, all_mu, temperature=temperature)
-
-    metrics, ranks = compute_metrics(scores, query_vid_map, test_ids)
-
-    analyze_results(scores, all_mu, queries, query_vid_map,
-                    test_ids, ranks, cfg, log_dir, tag="full")
-
-    return metrics
-
-
-def evaluate_1k_a(model, encoder, test_ids, gt, narrations, device, cfg, log_dir):
-    """MSR-VTT 1K-A 评估：video7010~video8009，每个视频取第一条 GT caption。"""
-    test_1k_ids = [f"video{i}" for i in range(7010, 8010)]
-    logger.info(f"\n=== 1K-A Test Evaluation ({len(test_1k_ids)} videos) ===")
-
-    all_mu = build_video_representations(model, encoder, test_1k_ids, narrations, device)
-    print_prototype_statistics(all_mu, test_1k_ids)
-
-    queries = []
-    query_vid_map = []
-    for vid in test_1k_ids:
-        if vid in gt and len(gt[vid]) > 0:
-            queries.append(gt[vid][0])
-            query_vid_map.append(vid)
-
-    logger.info(f"Total queries: {len(queries)}")
-    all_s_T = build_query_representations(model, encoder, queries, device)
-
-    temperature = model.temperature.item()
-    scores = cosine_retrieval_score(all_s_T, all_mu, temperature=temperature)
-
-    metrics, ranks = compute_metrics(scores, query_vid_map, test_1k_ids)
-
-    analyze_results(scores, all_mu, queries, query_vid_map,
-                    test_1k_ids, ranks, cfg, log_dir, tag="1k-A")
-
-    return metrics
-
+# ─────────────── main ─────────────────
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/default.yaml")
+    parser.add_argument("--config", type=str, default="configs/default_pq.yaml")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/best_model.pt")
     parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--test_mode", type=str, default=None, help="full | 1k-A | both")
+    parser.add_argument("--test_mode", type=str, default="full",
+                        help="full | 1k-A | both")
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
-    # ---- 初始化日志 ----
+    # 日志
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -291,49 +396,74 @@ def main():
     logger.addHandler(fh)
     logger.addHandler(sh)
 
-    scheme = cfg.get("scheme", "swav")
-    logger.info(f"Config: {args.config}, Scheme: {scheme}")
+    logger.info(f"Config: {args.config}")
     logger.info(f"Checkpoint: {args.checkpoint}")
-    logger.info(f"Log file: {log_file}")
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
-    test_mode = args.test_mode or cfg["eval"]["test_mode"]
 
     # 数据
     narrations = load_narrations(cfg["data"]["narration_json"])
     gt = load_gt_annotations(cfg["data"]["msrvtt_json"])
     _, _, test_ids = get_split_video_ids(cfg["split"]["train_end"], cfg["split"]["val_end"])
 
-    # 编码器
+    # CLIP 编码器
     encoder = CLIPTextEncoder(
         model_name=cfg["encoder"]["name"],
         max_length=cfg["encoder"]["max_token_length"],
     ).to(device)
     encoder.eval()
 
-    # 模型
-    model = build_model(cfg, device)
+    # NucleusFilter
+    nf_cfg = cfg["nucleus_filter"]
+    nucleus_filter = NucleusFilter(
+        feature_dim=cfg["encoder"]["feature_dim"],
+        num_heads=nf_cfg["num_heads"],
+        temporal_layers=nf_cfg["temporal_layers"],
+        temporal_ffn=nf_cfg["temporal_ffn"],
+        max_seq_len=nf_cfg["max_seq_len"],
+    ).to(device)
+    nucleus_filter.eval()
 
+    # PseudoQueryPipeline
+    model = PseudoQueryPipeline(
+        feature_dim=cfg["encoder"]["feature_dim"],
+        adapter_hidden_mult=cfg["model"]["adapter_hidden_mult"],
+        reranker_num_heads=cfg["model"]["reranker_num_heads"],
+        temperature_init=cfg["model"]["temperature_init"],
+        fine_loss_weight=cfg["model"]["fine_loss_weight"],
+    ).to(device)
+    model.eval()
+
+    # 加载 checkpoint
     ckpt_path = Path(args.checkpoint)
     if ckpt_path.exists():
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
         model.load_state_dict(ckpt["model_state_dict"])
+        nucleus_filter.load_state_dict(ckpt["nucleus_filter_state_dict"])
         logger.info(f"Loaded checkpoint from {ckpt_path}")
     else:
         logger.warning(f"Checkpoint {ckpt_path} not found. Using random weights.")
 
-    model.eval()
+    frame_feat_dir = cfg["data"]["frame_feat_dir"]
+    test_mode = args.test_mode
 
     # 评估
     if test_mode in ("full", "both"):
-        metrics = evaluate_full_test(model, encoder, test_ids, gt, narrations, device, cfg, log_dir)
+        metrics = evaluate_two_stage(
+            encoder, nucleus_filter, model, test_ids, gt, narrations,
+            frame_feat_dir, device, cfg, log_dir, tag="full",
+        )
         logger.info("\n[Full Test] Results:")
         for k, v in metrics.items():
             logger.info(f"  {k}: {v:.2f}")
 
     if test_mode in ("1k-A", "both"):
-        metrics = evaluate_1k_a(model, encoder, test_ids, gt, narrations, device, cfg, log_dir)
+        test_1k_ids = [f"video{i}" for i in range(7010, 8010)]
+        metrics = evaluate_two_stage(
+            encoder, nucleus_filter, model, test_1k_ids, gt, narrations,
+            frame_feat_dir, device, cfg, log_dir, tag="1k-A",
+        )
         logger.info("\n[1K-A Test] Results:")
         for k, v in metrics.items():
             logger.info(f"  {k}: {v:.2f}")

@@ -1,0 +1,11 @@
+# ──────────────────────────────────────────────────────────────
+# AGC 伪查询实验 — 训练数据集配置 (带验证集)
+# 使用 is_split: true 模式，单独指定验证集
+# ──────────────────────────────────────────────────────────────
+datasets:
+  - is_split: true
+    train_path: experiment/data/train.jsonl
+    valid_path: experiment/data/train.jsonl    # 暂时用 train 的子集做验证
+    corpus_path: experiment/data/train_corpus.jsonl
+    dataset_name: json
+    corpus_name: json

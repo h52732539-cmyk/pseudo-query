@@ -1,9 +1,8 @@
 """
-训练主循环：逐原型对比损失 + SwAV 原型学习。
-支持方案B (SwAV) 和方案C (Hybrid EMA+SwAV)。
+训练主循环：跨模态核过滤 + 查询-伪查询映射学习（Adapter + Reranker 联合训练）。
 
 用法:
-    python train.py [--config configs/default.yaml]
+    python train.py [--config configs/default_pq.yaml]
 """
 import argparse
 import os
@@ -13,16 +12,17 @@ from datetime import datetime
 import yaml
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
 from pathlib import Path
 from tqdm import tqdm
 
 from data.preprocess import load_narrations, load_gt_annotations, get_split_video_ids, build_retrieval_pairs
-from data.dataset import PseudoQueryMultiViewDataset, multiview_collate_fn
+from data.dataset import QueryNarrationDataset, query_narration_collate_fn
 from models.clip_encoder import CLIPTextEncoder
-from models.pipeline_swav import SwAVPipelineModel
-from models.pipeline_hybrid import HybridPipelineModel
+from models.nucleus_filter import NucleusFilter
+from models.pipeline_pq import PseudoQueryPipeline
 
 
 def encode_video_captions(encoder, captions_list, device, max_tokens=512):
@@ -64,41 +64,39 @@ def encode_video_captions(encoder, captions_list, device, max_tokens=512):
     return padded, mask
 
 
-def build_model(cfg, device):
-    """根据 scheme 配置构建模型"""
-    scheme = cfg.get("scheme", "swav")
-    swav_cfg = cfg.get("swav", {})
+def encode_narr_sentences(encoder, captions_list, device, max_narrs=64):
+    """
+    编码一个 batch 中所有视频的 narration sentence embeddings。
+    Returns:
+        narr_sent: (B, N_max, d) — padded
+        narr_mask: (B, N_max) — 1=valid, 0=pad
+    """
+    batch_embs = []
+    batch_lens = []
 
-    if scheme == "hybrid":
-        ema_cfg = cfg.get("ema", {})
-        model = HybridPipelineModel(
-            feature_dim=cfg["encoder"]["feature_dim"],
-            num_prototypes=cfg["prototype"]["num_prototypes"],
-            aggregation=cfg["model"]["aggregation"],
-            temperature_init=cfg["model"]["temperature_init"],
-            sinkhorn_eps=swav_cfg.get("sinkhorn_eps", 0.05),
-            sinkhorn_iters=swav_cfg.get("sinkhorn_iters", 3),
-            swav_temperature=swav_cfg.get("temperature", 0.1),
-            ema_decay=ema_cfg.get("decay", 0.999),
-            dead_proto_threshold=ema_cfg.get("dead_proto_threshold", 100),
-        )
-    else:
-        model = SwAVPipelineModel(
-            feature_dim=cfg["encoder"]["feature_dim"],
-            num_prototypes=cfg["prototype"]["num_prototypes"],
-            aggregation=cfg["model"]["aggregation"],
-            temperature_init=cfg["model"]["temperature_init"],
-            sinkhorn_eps=swav_cfg.get("sinkhorn_eps", 0.05),
-            sinkhorn_iters=swav_cfg.get("sinkhorn_iters", 3),
-            swav_temperature=swav_cfg.get("temperature", 0.1),
-        )
+    for captions in captions_list:
+        caps = captions[:max_narrs]
+        embs = encoder.encode_sentence(caps, device=device)  # (N_i, d)
+        batch_embs.append(embs)
+        batch_lens.append(embs.shape[0])
 
-    return model.to(device)
+    N_max = max(batch_lens)
+    d = batch_embs[0].shape[-1]
+    B = len(batch_embs)
+
+    padded = torch.zeros(B, N_max, d, device=device)
+    mask = torch.zeros(B, N_max, device=device)
+    for i, emb in enumerate(batch_embs):
+        n = emb.shape[0]
+        padded[i, :n] = emb
+        mask[i, :n] = 1.0
+
+    return padded, mask
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/default.yaml")
+    parser.add_argument("--config", type=str, default="configs/default_pq.yaml")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--resume", type=str, default=None, help="checkpoint path to resume from")
     args = parser.parse_args()
@@ -123,8 +121,7 @@ def main():
     logger.addHandler(fh)
     logger.addHandler(sh)
 
-    scheme = cfg.get("scheme", "swav")
-    logger.info(f"Config: {args.config}, Scheme: {scheme}")
+    logger.info(f"Config: {args.config}, Scheme: pq")
     logger.info(f"Log file: {log_file}")
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -142,14 +139,15 @@ def main():
     val_pairs = build_retrieval_pairs(val_ids, gt)
     logger.info(f"Train pairs: {len(train_pairs)}, Val pairs: {len(val_pairs)}")
 
-    train_dataset = PseudoQueryMultiViewDataset(train_pairs, narrations)
-    val_dataset = PseudoQueryMultiViewDataset(val_pairs, narrations)
+    frame_feat_dir = cfg["data"].get("frame_feat_dir", None)
+    train_dataset = QueryNarrationDataset(train_pairs, narrations, frame_feat_dir)
+    val_dataset = QueryNarrationDataset(val_pairs, narrations, frame_feat_dir)
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=cfg["training"]["batch_size"],
         shuffle=True,
-        collate_fn=multiview_collate_fn,
+        collate_fn=query_narration_collate_fn,
         num_workers=cfg["training"]["num_workers"],
         pin_memory=True,
         drop_last=True,
@@ -158,7 +156,7 @@ def main():
         val_dataset,
         batch_size=cfg["training"]["batch_size"],
         shuffle=False,
-        collate_fn=multiview_collate_fn,
+        collate_fn=query_narration_collate_fn,
         num_workers=cfg["training"]["num_workers"],
         pin_memory=True,
         drop_last=False,
@@ -171,18 +169,40 @@ def main():
     ).to(device)
     encoder.eval()
 
-    # ---- 模型 ----
-    model = build_model(cfg, device)
-    logger.info(f"Model: {model.__class__.__name__}, K={cfg['prototype']['num_prototypes']}")
+    # ---- 核过滤模块 ----
+    nf_cfg = cfg.get("nucleus_filter", {})
+    nucleus_filter = NucleusFilter(
+        feature_dim=cfg["encoder"]["feature_dim"],
+        num_heads=nf_cfg.get("num_heads", 8),
+        temporal_layers=nf_cfg.get("temporal_layers", 4),
+        temporal_ffn=nf_cfg.get("temporal_ffn", 2048),
+        max_seq_len=nf_cfg.get("max_seq_len", 128),
+    ).to(device)
+
+    # ---- Pipeline 模型 ----
+    model_cfg = cfg.get("model", {})
+    model = PseudoQueryPipeline(
+        feature_dim=cfg["encoder"]["feature_dim"],
+        adapter_hidden_mult=model_cfg.get("adapter_hidden_mult", 4),
+        reranker_num_heads=model_cfg.get("reranker_num_heads", 8),
+        temperature_init=model_cfg.get("temperature_init", 0.07),
+        fine_loss_weight=model_cfg.get("fine_loss_weight", 0.5),
+    ).to(device)
+
+    logger.info(f"NucleusFilter params: {sum(p.numel() for p in nucleus_filter.parameters() if p.requires_grad):,}")
+    logger.info(f"Pipeline params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=True)
         model.load_state_dict(ckpt["model_state_dict"])
+        if "nucleus_filter_state_dict" in ckpt:
+            nucleus_filter.load_state_dict(ckpt["nucleus_filter_state_dict"])
         logger.info(f"Resumed from {args.resume}")
 
     # ---- 优化器 & 调度器 ----
+    all_params = list(model.parameters()) + list(nucleus_filter.parameters())
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        all_params,
         lr=cfg["training"]["lr"],
         weight_decay=cfg["training"]["weight_decay"],
     )
@@ -201,8 +221,7 @@ def main():
     amp_device = "cuda" if device != "cpu" else "cpu"
     scaler = GradScaler(amp_device, enabled=use_amp)
 
-    swav_alpha = cfg["training"].get("swav_alpha", 0.5)
-    is_hybrid = scheme == "hybrid"
+    max_narr_tokens = cfg["training"].get("max_narr_tokens", 512)
 
     # ---- 训练循环 ----
     save_dir = Path("checkpoints")
@@ -212,66 +231,102 @@ def main():
     for epoch in range(cfg["training"]["epochs"]):
         # === Train ===
         model.train()
+        nucleus_filter.train()
         train_loss_sum = 0.0
+        train_coarse_sum = 0.0
+        train_fine_sum = 0.0
         train_steps = 0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{cfg['training']['epochs']} [Train]")
-        for video_ids, caps_v1, caps_v2, queries in pbar:
-            # 编码（冻结 CLIP）
+        for video_ids, queries, narr_texts, frame_features in pbar:
+            # CLIP 编码（冻结，无梯度）
             with torch.no_grad():
-                v1_feats, v1_mask = encode_video_captions(encoder, caps_v1, device)
-                v2_feats, v2_mask = encode_video_captions(encoder, caps_v2, device)
-                q_feats, q_mask = encoder.encode_tokens(queries, device=device)
+                q_sent = encoder.encode_sentence(queries, device=device)  # (B, d)
+                q_tokens, q_mask = encoder.encode_tokens(queries, device=device)  # (B, L, d), (B, L)
+                narr_sent, narr_mask = encode_narr_sentences(encoder, narr_texts, device)  # (B, N, d), (B, N)
+                narr_tokens, narr_tok_mask = encode_video_captions(encoder, narr_texts, device, max_narr_tokens)
+
+            # 帧特征
+            if frame_features is not None:
+                frame_features = frame_features.to(device)
+            else:
+                # fallback: 随机帧特征（开发测试用）
+                B = q_sent.shape[0]
+                frame_features = F.normalize(torch.randn(B, 12, q_sent.shape[-1], device=device), p=2, dim=-1)
 
             with autocast(amp_device, enabled=use_amp):
-                h_avg, mu1, mu2, s_T, q_tilde = model(
-                    v1_feats, v1_mask, v2_feats, v2_mask, q_feats, q_mask
+                # 核过滤（可训练，有梯度）
+                _, enhanced_n = nucleus_filter.enhance_features(frame_features, narr_sent, narr_mask)
+                soft_weights = nucleus_filter.compute_filter_weights(q_sent, enhanced_n, narr_mask)  # (B, N)
+
+                # 过滤后 centroid = 加权聚合 原始 CLIP narration embeddings
+                # narr_sent: (B, N, d), soft_weights: (B, N)
+                filtered_centroid = (soft_weights.unsqueeze(-1) * narr_sent).sum(dim=1)  # (B, d)
+                filtered_centroid = F.normalize(filtered_centroid, p=2, dim=-1)
+
+                # Pipeline 前向（纯文本空间）
+                adapted_query, fine_score_matrix = model(
+                    q_sent, q_tokens, q_mask, narr_tokens, narr_tok_mask
                 )
-                loss_total, loss_match, loss_swav = model.compute_loss(
-                    h_avg, mu1, mu2, s_T, q_tilde, swav_alpha=swav_alpha
+
+                # 损失计算
+                loss_total, loss_coarse, loss_fine = model.compute_loss(
+                    adapted_query, filtered_centroid, fine_score_matrix
                 )
 
             optimizer.zero_grad()
             scaler.scale(loss_total).backward()
             scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), cfg["training"]["gradient_clip"])
+            nn.utils.clip_grad_norm_(all_params, cfg["training"]["gradient_clip"])
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
 
-            # 方案C: 每步更新 EMA + 死原型检查
-            if is_hybrid:
-                n_dead = model.post_step(s_T.detach(), v1_feats.detach())
-                if n_dead > 0:
-                    logger.info(f"  [EMA] Reinitialized {n_dead} dead prototypes")
-
             train_loss_sum += loss_total.item()
+            train_coarse_sum += loss_coarse.item()
+            train_fine_sum += loss_fine.item()
             train_steps += 1
             pbar.set_postfix(
                 loss=f"{loss_total.item():.4f}",
-                match=f"{loss_match.item():.4f}",
-                swav=f"{loss_swav.item():.4f}",
+                coarse=f"{loss_coarse.item():.4f}",
+                fine=f"{loss_fine.item():.4f}",
                 tau=f"{model.temperature.item():.4f}",
             )
 
         avg_train_loss = train_loss_sum / max(train_steps, 1)
+        avg_coarse = train_coarse_sum / max(train_steps, 1)
+        avg_fine = train_fine_sum / max(train_steps, 1)
 
         # === Validation ===
         model.eval()
+        nucleus_filter.eval()
         val_loss_sum = 0.0
         val_steps = 0
         with torch.no_grad():
-            for video_ids, caps_v1, caps_v2, queries in tqdm(val_loader, desc="[Val]"):
-                v1_feats, v1_mask = encode_video_captions(encoder, caps_v1, device)
-                v2_feats, v2_mask = encode_video_captions(encoder, caps_v2, device)
-                q_feats, q_mask = encoder.encode_tokens(queries, device=device)
+            for video_ids, queries, narr_texts, frame_features in tqdm(val_loader, desc="[Val]"):
+                q_sent = encoder.encode_sentence(queries, device=device)
+                q_tokens, q_mask = encoder.encode_tokens(queries, device=device)
+                narr_sent, narr_mask = encode_narr_sentences(encoder, narr_texts, device)
+                narr_tokens, narr_tok_mask = encode_video_captions(encoder, narr_texts, device, max_narr_tokens)
+
+                if frame_features is not None:
+                    frame_features = frame_features.to(device)
+                else:
+                    B = q_sent.shape[0]
+                    frame_features = F.normalize(torch.randn(B, 12, q_sent.shape[-1], device=device), p=2, dim=-1)
 
                 with autocast(amp_device, enabled=use_amp):
-                    h_avg, mu1, mu2, s_T, q_tilde = model(
-                        v1_feats, v1_mask, v2_feats, v2_mask, q_feats, q_mask
+                    _, enhanced_n = nucleus_filter.enhance_features(frame_features, narr_sent, narr_mask)
+                    soft_weights = nucleus_filter.compute_filter_weights(q_sent, enhanced_n, narr_mask)
+                    filtered_centroid = F.normalize(
+                        (soft_weights.unsqueeze(-1) * narr_sent).sum(dim=1), p=2, dim=-1
+                    )
+
+                    adapted_query, fine_score_matrix = model(
+                        q_sent, q_tokens, q_mask, narr_tokens, narr_tok_mask
                     )
                     loss_total, _, _ = model.compute_loss(
-                        h_avg, mu1, mu2, s_T, q_tilde, swav_alpha=swav_alpha
+                        adapted_query, filtered_centroid, fine_score_matrix
                     )
 
                 val_loss_sum += loss_total.item()
@@ -279,39 +334,34 @@ def main():
 
         avg_val_loss = val_loss_sum / max(val_steps, 1)
         current_lr = scheduler.get_last_lr()[0]
-        logger.info(f"Epoch {epoch+1}: train_loss={avg_train_loss:.4f}, val_loss={avg_val_loss:.4f}")
+        logger.info(
+            f"Epoch {epoch+1}: train_loss={avg_train_loss:.4f} "
+            f"(coarse={avg_coarse:.4f}, fine={avg_fine:.4f}), "
+            f"val_loss={avg_val_loss:.4f}"
+        )
         logger.info(
             f"EPOCH_SUMMARY | epoch={epoch+1} | train_loss={avg_train_loss:.6f} "
-            f"| val_loss={avg_val_loss:.6f} | swav_alpha={swav_alpha} "
+            f"| val_loss={avg_val_loss:.6f} "
             f"| tau={model.temperature.item():.6f} | lr={current_lr:.8f}"
         )
 
         # Save best
+        ckpt_data = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "nucleus_filter_state_dict": nucleus_filter.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "val_loss": avg_val_loss,
+            "scheme": "pq",
+        }
+
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "val_loss": avg_val_loss,
-                    "scheme": scheme,
-                },
-                save_dir / "best_model.pt",
-            )
+            torch.save(ckpt_data, save_dir / "best_model.pt")
             logger.info(f"  ✓ Best model saved (val_loss={avg_val_loss:.4f})")
 
         # Save latest
-        torch.save(
-            {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "val_loss": avg_val_loss,
-                "scheme": scheme,
-            },
-            save_dir / "latest_model.pt",
-        )
+        torch.save(ckpt_data, save_dir / "latest_model.pt")
 
     logger.info("Training finished.")
 

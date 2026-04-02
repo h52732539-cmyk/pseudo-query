@@ -1,0 +1,50 @@
+scheme: "pq"
+
+encoder:
+  name: "openai/clip-vit-base-patch32"
+  feature_dim: 512
+  max_token_length: 77
+
+data:
+  narration_json: "MSRVTT_narration.json"
+  msrvtt_json: "MSR_VTT.json"
+  frame_feat_dir: "data/msrvtt_clip_frames"
+
+split:
+  train_end: 6513
+  val_end: 7010
+
+nucleus_filter:
+  num_heads: 8
+  temporal_layers: 4
+  temporal_ffn: 2048
+  max_seq_len: 128
+  inference_threshold: 0.4
+
+prototype:
+  num_prototypes: 256
+  sinkhorn_eps: 0.05
+  sinkhorn_iters: 3
+  cluster_rounds: 10
+
+retrieval:
+  coarse_top_m: 10
+  fine_max_candidates: 200
+
+model:
+  temperature_init: 0.07
+  adapter_hidden_mult: 4
+  reranker_num_heads: 8
+  fine_loss_weight: 0.5
+
+training:
+  epochs: 30
+  batch_size: 32
+  lr: 1.0e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  gradient_clip: 1.0
+  fp16: true
+  seed: 42
+  num_workers: 4
+  max_narr_tokens: 512

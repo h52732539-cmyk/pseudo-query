@@ -9,16 +9,20 @@
 set -euo pipefail
 
 # ─── 配置 ─────────────────────────────────────────────────────
-OMNI_COL_PRESS_DIR="${OMNI_COL_PRESS_DIR:-/path/to/omni-col-press}"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+OMNI_COL_PRESS_DIR="${OMNI_COL_PRESS_DIR:-${PROJECT_DIR}/omni-col-press}"
 
-NUM_GPUS="${NUM_GPUS:-4}"
+NUM_GPUS="${NUM_GPUS:-1}"
 NUM_REPR_VECTORS="${NUM_REPR_VECTORS:-32}"
 NUM_APPENDING_TOKENS="${NUM_APPENDING_TOKENS:-32}"
 PASSAGE_MAX_LEN="${PASSAGE_MAX_LEN:-1024}"
 
+# 使用的 GPU (与训练对齐，使用 GPU 7)
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-7}"
+export CUDA_VISIBLE_DEVICES
+
 # 训练好的模型检查点路径
-MODEL_PATH="${MODEL_PATH:-${PROJECT_DIR}/experiment/outputs/agc_pq_b${NUM_REPR_VECTORS}}"
+MODEL_PATH="${MODEL_PATH:-${PROJECT_DIR}/outputs/agc_pq_b${NUM_REPR_VECTORS}}"
 
 # 索引类型: "multivec" (PyTorch brute-force) 或 "fast-plaid"
 INDEX_TYPE="${INDEX_TYPE:-multivec}"
@@ -26,6 +30,9 @@ INDEX_TYPE="${INDEX_TYPE:-multivec}"
 # 输出路径
 INDEX_DIR="${MODEL_PATH}/index_${INDEX_TYPE}"
 RESULT_DIR="${MODEL_PATH}/results"
+
+# 随机端口，避免与残留进程冲突
+MASTER_PORT=$((RANDOM % 10000 + 20000))
 
 # ─── 检查 ─────────────────────────────────────────────────────
 if [ ! -d "${OMNI_COL_PRESS_DIR}/src" ]; then
@@ -39,7 +46,7 @@ if [ ! -d "${MODEL_PATH}" ]; then
     exit 1
 fi
 
-if [ ! -f "${PROJECT_DIR}/experiment/data/test_corpus.jsonl" ]; then
+if [ ! -f "${PROJECT_DIR}/data/test_corpus.jsonl" ]; then
     echo "ERROR: Test data not found. Run prepare_data.py first."
     exit 1
 fi
@@ -55,10 +62,10 @@ echo "  Index type: ${INDEX_TYPE}"
 echo "  Budget:     ${NUM_REPR_VECTORS} tokens"
 echo "════════════════════════════════════════════════════════════"
 
-torchrun --nproc_per_node=${NUM_GPUS} -m src.build_index \
+torchrun --nproc_per_node=${NUM_GPUS} --master-port=${MASTER_PORT} -m src.build_index \
     --model_name_or_path "${MODEL_PATH}" \
     \
-    --corpus_path "${PROJECT_DIR}/experiment/data/test_corpus.jsonl" \
+    --corpus_path "${PROJECT_DIR}/data/test_corpus.jsonl" \
     --dataset_name json \
     \
     --encode_modalities '{"default": {"text": true, "image": false, "video": false, "audio": false}}' \
@@ -76,7 +83,7 @@ torchrun --nproc_per_node=${NUM_GPUS} -m src.build_index \
     --index_output_path "${INDEX_DIR}" \
     --index_type ${INDEX_TYPE} \
     --batch_size 8 \
-    --bf16
+    --dtype bfloat16
 
 echo ""
 echo "索引构建完成: ${INDEX_DIR}"
@@ -90,11 +97,12 @@ echo "  Qrels:    test_qrels.jsonl"
 echo "  Top-K:    1, 5, 10"
 echo "════════════════════════════════════════════════════════════"
 
-torchrun --nproc_per_node=${NUM_GPUS} -m src.evaluate \
+torchrun --nproc_per_node=${NUM_GPUS} --master-port=$((MASTER_PORT+1)) -m src.evaluate \
     --model_name_or_path "${MODEL_PATH}" \
     \
-    --query_path "${PROJECT_DIR}/experiment/data/test_queries.csv" \
-    --qrels_path "${PROJECT_DIR}/experiment/data/test_qrels.jsonl" \
+    --query_path "${PROJECT_DIR}/data/test_queries.csv" \
+    --qrels_path "${PROJECT_DIR}/data/test_qrels.jsonl" \
+    --dataset_name csv \
     \
     --encode_is_query \
     --encode_modalities '{"default": {"text": true, "image": false, "video": false, "audio": false}}' \
@@ -114,7 +122,7 @@ torchrun --nproc_per_node=${NUM_GPUS} -m src.evaluate \
     --output_path "${RESULT_DIR}" \
     --batch_size 8 \
     --top_k 1 5 10 \
-    --bf16
+    --dtype bfloat16
 
 echo ""
 echo "════════════════════════════════════════════════════════════"

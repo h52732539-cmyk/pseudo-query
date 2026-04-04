@@ -39,7 +39,7 @@ OUTPUT_DIR = Path(__file__).resolve().parent / "data"
 TRAIN_END = 6513       # video0 ~ video6512
 VAL_END = 7010         # video6513 ~ video7009
 TOTAL = 10000          # video7010 ~ video9999
-TEST_1K_SIZE = 1000    # MSR-VTT 1k-A test split
+TEST_1K_SIZE = 2990    # 全量 test split (video7010 ~ video9999)
 
 
 def load_narrations(path: Path) -> dict:

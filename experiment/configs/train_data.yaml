@@ -3,8 +3,8 @@
 # 用于 OmniColPress 框架的 --train_yaml 参数
 # ──────────────────────────────────────────────────────────────
 datasets:
-  - train_path: experiment/data/train.jsonl
-    corpus_path: experiment/data/train_corpus.jsonl
+  - train_path: /hpc2hdd/home/yuxuanzhao/xuhaodong/pseudo-query/experiment/data/train.jsonl
+    corpus_path: /hpc2hdd/home/yuxuanzhao/xuhaodong/pseudo-query/experiment/data/train_corpus.jsonl
     # 不使用视频/图片/音频资产，纯文本实验
     # corpus_assets_path: (unused)
     dataset_name: json

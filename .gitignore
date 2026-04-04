@@ -8,3 +8,5 @@ external/
 *.json
 logs/
 *.log
+checkpoints/
+outputs/

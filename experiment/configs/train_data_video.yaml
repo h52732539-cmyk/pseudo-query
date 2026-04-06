@@ -1,0 +1,11 @@
+# ──────────────────────────────────────────────────────────────
+# AGC 视频原始实验 — 训练数据集配置
+# 文档侧：MSRVTT 原始 MP4 视频文件
+# corpus_assets_path 指向视频目录，video 字段为 mp4 文件名
+# ──────────────────────────────────────────────────────────────
+datasets:
+  - train_path: /hpc2hdd/home/yuxuanzhao/xuhaodong/pseudo-query/experiment/data-video/train.jsonl
+    corpus_path: /hpc2hdd/home/yuxuanzhao/xuhaodong/pseudo-query/experiment/data-video/train_corpus.jsonl
+    corpus_assets_path: /hpc2hdd/home/yuxuanzhao/xuhaodong/MSRVTT/videos/all
+    dataset_name: json
+    corpus_name: json

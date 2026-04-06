@@ -1,0 +1,53 @@
+scheme: "agc"
+
+encoder:
+  name: "openai/clip-vit-base-patch32"
+  feature_dim: 512
+  hidden_dim: 768
+  max_token_length: 77
+
+data:
+  msrvtt_json: "/hpc2hdd/home/yuxuanzhao/xuhaodong/MSRVTT/annotation/MSR_VTT.json"
+  video_dir: "/hpc2hdd/home/yuxuanzhao/xuhaodong/MSRVTT/videos/all"
+  frame_feat_dir: "/hpc2hdd/home/yuxuanzhao/xuhaodong/pseudo-query/AGC/data/msrvtt_clip_frames"
+  num_frames: 12
+
+split:
+  train_end: 6513
+  val_end: 7010
+
+agc:
+  codebook_size: 128
+  num_pseudo_queries: 32
+  num_encoder_layers: 4
+  num_heads: 8
+  ffn_dim: 2048
+  dropout: 0.1
+  lambda_init: 0.1
+  tau_start: 1.0
+  tau_end: 0.1
+  pool_type: "attention"
+
+loss:
+  temperature_init: 0.07
+  beta_div: 0.0
+  beta_bal: 0.0
+  tau_div: 0.5
+
+training:
+  epochs: 30
+  batch_size: 32
+  lr: 1.0e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  gradient_clip: 1.0
+  fp16: true
+  seed: 42
+  num_workers: 4
+
+monitor:
+  check_every_n_epochs: 1
+  codebook_cos_mean_alarm: 0.5
+  codebook_cos_max_alarm: 0.8
+  cluster_gini_alarm: 0.3
+  cluster_dead_ratio_alarm: 0.1

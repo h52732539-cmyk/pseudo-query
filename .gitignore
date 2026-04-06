@@ -10,3 +10,4 @@ logs/
 *.log
 checkpoints/
 outputs/
+data-video/

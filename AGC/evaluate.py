@@ -24,6 +24,7 @@ sys.path.insert(0, str(AGC_DIR))
 from models.clip_encoder import CLIPTextEncoder
 from models.agc_module import AGCModel
 from models.losses import max_sim_scores
+from failure_analysis import run_failure_analysis
 
 logger = logging.getLogger("agc_eval")
 
@@ -84,9 +85,10 @@ def compute_metrics(scores, query_vid_map, video_ids):
 
 @torch.no_grad()
 def precompute_video_representations(model, video_ids, frame_feat_dir, device, batch_size=64, tau=0.01):
-    """对所有视频计算压缩表示 {c_k}。"""
+    """对所有视频计算压缩表示 {c_k} 和聚类分配 w。"""
     feat_dir = Path(frame_feat_dir)
     all_c = {}
+    all_w = {}
 
     valid_vids = [v for v in video_ids if (feat_dir / f"{v}.pt").exists()]
     logger.info(f"Computing representations for {len(valid_vids)} videos ...")
@@ -94,9 +96,11 @@ def precompute_video_representations(model, video_ids, frame_feat_dir, device, b
     for start in tqdm(range(0, len(valid_vids), batch_size), desc="Video encoding"):
         batch_vids = valid_vids[start:start + batch_size]
         feats = []
+        feat_lens = []
         for vid in batch_vids:
             f = torch.load(feat_dir / f"{vid}.pt", weights_only=True).float()
             feats.append(f)
+            feat_lens.append(f.size(0))
 
         # 对齐长度
         max_n = max(f.size(0) for f in feats)
@@ -107,11 +111,14 @@ def precompute_video_representations(model, video_ids, frame_feat_dir, device, b
             padded[i, :f.size(0)] = f
         padded = padded.to(device)
 
-        c, _ = model(padded, tau=tau)  # (B, m, h)
+        c, aux = model(padded, tau=tau)  # (B, m, h)
         for i, vid in enumerate(batch_vids):
             all_c[vid] = c[i].cpu()
+            # 取实际 token 数 (非 padding)
+            n_tokens = feat_lens[i]
+            all_w[vid] = aux["w"][i, :n_tokens].cpu()
 
-    return all_c
+    return all_c, all_w
 
 
 # ─────────────── 评估入口 ───────────────
@@ -123,7 +130,7 @@ def evaluate(model, text_encoder, video_ids, gt, frame_feat_dir, device, cfg):
     tau = cfg["agc"]["tau_end"]
 
     # Step 1: 预计算视频表示
-    all_c = precompute_video_representations(model, video_ids, frame_feat_dir, device, tau=tau)
+    all_c, all_w = precompute_video_representations(model, video_ids, frame_feat_dir, device, tau=tau)
     valid_vids = [v for v in video_ids if v in all_c]
 
     # Step 2: 构建查询列表
@@ -162,7 +169,7 @@ def evaluate(model, text_encoder, video_ids, gt, frame_feat_dir, device, cfg):
 
     # Step 4: 计算指标
     metrics, ranks = compute_metrics(all_scores, query_vid_map, valid_vids)
-    return metrics, ranks
+    return metrics, ranks, all_scores, query_vid_map, valid_vids, all_w
 
 
 def main():
@@ -171,6 +178,7 @@ def main():
     parser.add_argument("--checkpoint", type=str, default="checkpoints/best.pt")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--split", type=str, default="test", choices=["val", "test"])
+    parser.add_argument("--no-failure-analysis", action="store_true", help="跳过失效分析")
     args = parser.parse_args()
 
     # 日志
@@ -233,7 +241,9 @@ def main():
     )
     eval_ids = val_ids if args.split == "val" else test_ids
 
-    metrics, ranks = evaluate(model, text_encoder, eval_ids, gt, cfg["data"]["frame_feat_dir"], device, cfg)
+    metrics, ranks, all_scores, query_vid_map, valid_vids, all_w = evaluate(
+        model, text_encoder, eval_ids, gt, cfg["data"]["frame_feat_dir"], device, cfg
+    )
 
     logger.info(f"\n{'='*50}")
     logger.info(f"  {args.split.upper()} Results")
@@ -244,10 +254,28 @@ def main():
     logger.info(f"  MnR:  {metrics['MnR']:.1f}")
     logger.info(f"{'='*50}")
 
+    # 失效分析
+    if not args.no_failure_analysis:
+        logger.info(f"\n{'='*50}")
+        logger.info(f"  {args.split.upper()} 失效分析")
+        logger.info(f"{'='*50}")
+        fa_report = run_failure_analysis(
+            all_scores=all_scores,
+            query_vid_map=query_vid_map,
+            video_ids=valid_vids,
+            all_w=all_w,
+            codebook=model.codebook.detach().cpu(),
+            logger_fn=logger.info,
+        )
+
     # 保存结果
     result_path = log_dir / f"eval_{args.split}_{timestamp}.json"
+    result_data = {"metrics": metrics, "config": cfg}
+    if not args.no_failure_analysis:
+        # 去掉不可序列化的内部字段
+        result_data["failure_analysis"] = fa_report
     with open(result_path, "w") as f:
-        json.dump({"metrics": metrics, "config": cfg}, f, indent=2)
+        json.dump(result_data, f, indent=2, ensure_ascii=False)
     logger.info(f"Results saved to {result_path}")
 
 

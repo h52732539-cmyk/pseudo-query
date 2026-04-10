@@ -32,6 +32,7 @@ from models.clip_encoder import CLIPTextEncoder
 from models.agc_module import AGCModel
 from models.losses import max_sim_scores, info_nce_loss, codebook_diversity_loss, cluster_balance_loss
 from monitor import compute_codebook_health, compute_cluster_balance
+from failure_analysis import run_failure_analysis
 
 
 # ─────────────── 数据加载工具 ───────────────
@@ -77,7 +78,7 @@ def get_annealing_tau(step: int, total_steps: int, tau_start: float, tau_end: fl
 # ─────────────── 验证 ───────────────
 
 @torch.no_grad()
-def validate(model, text_encoder, val_loader, device, tau, cfg):
+def validate(model, text_encoder, val_loader, device, tau, cfg, collect_w=False):
     """验证集上计算平均 loss 和 R@1/R@5/R@10。"""
     model.eval()
     total_loss = 0.0
@@ -85,6 +86,7 @@ def validate(model, text_encoder, val_loader, device, tau, cfg):
 
     # 同时收集视频表示用于检索评估
     vid_reprs = {}   # vid → (m, h)
+    vid_w = {}       # vid → (n, m) 聚类分配权重 (用于失效分析)
     query_vids = []  # 每个 query 对应的 GT vid
     query_texts = []
 
@@ -108,6 +110,10 @@ def validate(model, text_encoder, val_loader, device, tau, cfg):
         for i, vid in enumerate(video_ids):
             if vid not in vid_reprs:
                 vid_reprs[vid] = c[i].cpu()
+                if collect_w and "w" in aux:
+                    # 取实际 token 数 (非 padding)
+                    n_tokens = mask[i].sum().int().item() if mask is not None else aux["w"].size(1)
+                    vid_w[vid] = aux["w"][i, :n_tokens].cpu()
             query_vids.append(vid)
             query_texts.append(captions[i])
 
@@ -158,7 +164,8 @@ def validate(model, text_encoder, val_loader, device, tau, cfg):
     }
 
     model.train()
-    return avg_loss, metrics
+    return avg_loss, metrics, {"all_scores": all_scores.cpu(), "query_vids": query_vids,
+                                "unique_vids": unique_vids, "vid_w": vid_w}
 
 
 # ─────────────── 主训练函数 ───────────────
@@ -366,8 +373,13 @@ def main():
         avg_train_loss = train_loss_sum / max(train_steps, 1)
 
         # 验证
+        mon_cfg = cfg.get("monitor", {})
         val_tau = agc_cfg["tau_end"]  # 验证用接近硬分配
-        val_loss, val_metrics = validate(model, text_encoder, val_loader, device, val_tau, cfg)
+        fa_every = mon_cfg.get("failure_analysis_every_n_epochs", 5)
+        do_fa = ((epoch + 1) % fa_every == 0) or (epoch == cfg["training"]["epochs"] - 1)
+        val_loss, val_metrics, val_extra = validate(
+            model, text_encoder, val_loader, device, val_tau, cfg, collect_w=do_fa
+        )
 
         logger.info(
             f"Epoch {epoch+1} | "
@@ -381,7 +393,6 @@ def main():
         )
 
         # 监控指标 (每 N epochs)
-        mon_cfg = cfg.get("monitor", {})
         check_every = mon_cfg.get("check_every_n_epochs", 1)
         if (epoch + 1) % check_every == 0:
             cb_health = compute_codebook_health(model.codebook.detach())
@@ -401,6 +412,18 @@ def main():
                     f"dead_ratio: {cl_balance['dead_ratio']:.3f}, "
                     f"max_load: {cl_balance['max_load_ratio']:.3f}"
                 )
+
+        # 失效分析 (每 N epochs 或最后一个 epoch)
+        if do_fa and val_extra["vid_w"]:
+            logger.info(f"  [Epoch {epoch+1}] 运行失效分析 ...")
+            fa_report = run_failure_analysis(
+                all_scores=val_extra["all_scores"],
+                query_vid_map=val_extra["query_vids"],
+                video_ids=val_extra["unique_vids"],
+                all_w=val_extra["vid_w"],
+                codebook=model.codebook.detach().cpu(),
+                logger_fn=logger.info,
+            )
 
         # 保存 checkpoint
         ckpt_data = {

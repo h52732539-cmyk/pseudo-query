@@ -30,8 +30,8 @@ agc:
 
 loss:
   temperature_init: 0.07
-  beta_div: 0.0
-  beta_bal: 0.0
+  beta_div: 0.5
+  beta_bal: 0.5
   tau_div: 0.5
 
 training:
@@ -47,6 +47,7 @@ training:
 
 monitor:
   check_every_n_epochs: 1
+  failure_analysis_every_n_epochs: 5
   codebook_cos_mean_alarm: 0.5
   codebook_cos_max_alarm: 0.8
   cluster_gini_alarm: 0.3

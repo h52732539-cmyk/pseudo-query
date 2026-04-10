@@ -169,7 +169,7 @@ def evaluate(model, text_encoder, video_ids, gt, frame_feat_dir, device, cfg):
 
     # Step 4: 计算指标
     metrics, ranks = compute_metrics(all_scores, query_vid_map, valid_vids)
-    return metrics, ranks, all_scores, query_vid_map, valid_vids, all_w
+    return metrics, ranks, all_scores, query_vid_map, valid_vids, all_w, all_c
 
 
 def main():
@@ -241,7 +241,7 @@ def main():
     )
     eval_ids = val_ids if args.split == "val" else test_ids
 
-    metrics, ranks, all_scores, query_vid_map, valid_vids, all_w = evaluate(
+    metrics, ranks, all_scores, query_vid_map, valid_vids, all_w, all_c = evaluate(
         model, text_encoder, eval_ids, gt, cfg["data"]["frame_feat_dir"], device, cfg
     )
 
@@ -265,6 +265,7 @@ def main():
             video_ids=valid_vids,
             all_w=all_w,
             codebook=model.codebook.detach().cpu(),
+            all_c=all_c,
             logger_fn=logger.info,
         )
 

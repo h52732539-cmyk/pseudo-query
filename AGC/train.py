@@ -3,6 +3,7 @@ AGC 训练主循环: 伪查询聚类中心视频检索。
 
 用法:
     python train.py [--config configs/default_agc.yaml] [--device cuda] [--resume checkpoints/latest.pt]
+    python train.py --config configs/default_agc.yaml --overrides 'loss.beta_bal=0.2;training.lr=3e-5'
 """
 import argparse
 import json
@@ -100,8 +101,10 @@ def validate(model, text_encoder, val_loader, device, tau, cfg, collect_w=False)
         with autocast("cuda", enabled=use_amp):
             c, aux = model(features, tau=tau)
             scores = max_sim_scores(c, text_tokens, text_mask)
-            scores = scores * model.logit_scale.exp().clamp(max=100.0)
-            loss = info_nce_loss(scores)
+            logit_scale_max = cfg.get("loss", {}).get("logit_scale_max", 100.0)
+            scores = scores * model.logit_scale.exp().clamp(max=logit_scale_max)
+            label_smoothing = cfg.get("loss", {}).get("label_smoothing", 0.0)
+            loss = info_nce_loss(scores, label_smoothing=label_smoothing)
 
         total_loss += loss.item()
         total_steps += 1
@@ -165,26 +168,64 @@ def validate(model, text_encoder, val_loader, device, tau, cfg, collect_w=False)
 
     model.train()
     return avg_loss, metrics, {"all_scores": all_scores.cpu(), "query_vids": query_vids,
-                                "unique_vids": unique_vids, "vid_w": vid_w}
+                                "unique_vids": unique_vids, "vid_w": vid_w,
+                                "vid_reprs": vid_reprs}
 
 
 # ─────────────── 主训练函数 ───────────────
+
+def apply_overrides(cfg, overrides_str):
+    """将 'a.b=val;c.d=val' 格式的覆盖应用到 cfg dict。"""
+    if not overrides_str:
+        return cfg
+    for pair in overrides_str.split(";"):
+        pair = pair.strip()
+        if not pair:
+            continue
+        key, val = pair.split("=", 1)
+        keys = key.strip().split(".")
+        d = cfg
+        for k in keys[:-1]:
+            d = d[k]
+        # 自动类型转换
+        raw = val.strip()
+        if raw.lower() in ("true", "false"):
+            parsed = raw.lower() == "true"
+        else:
+            try:
+                parsed = int(raw)
+            except ValueError:
+                try:
+                    parsed = float(raw)
+                except ValueError:
+                    parsed = raw
+        d[keys[-1]] = parsed
+    return cfg
+
 
 def main():
     parser = argparse.ArgumentParser(description="AGC Training")
     parser.add_argument("--config", type=str, default="configs/default_agc.yaml")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--overrides", type=str, default=None,
+                        help="Semicolon-separated k=v overrides, e.g. 'loss.beta_bal=0.2;training.lr=3e-5'")
+    parser.add_argument("--run_name", type=str, default=None,
+                        help="Run name for checkpoint/log naming (used by hpsearch)")
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
+    if args.overrides:
+        cfg = apply_overrides(cfg, args.overrides)
+
     # 日志
     log_dir = AGC_DIR / "logs"
     log_dir.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = log_dir / f"train_{timestamp}.log"
+    run_tag = args.run_name or timestamp
+    log_file = log_dir / f"train_{run_tag}.log"
 
     logger = logging.getLogger("agc_train")
     logger.setLevel(logging.INFO)
@@ -308,8 +349,12 @@ def main():
 
     # 训练循环
     save_dir = AGC_DIR / "checkpoints"
-    save_dir.mkdir(exist_ok=True)
+    if args.run_name:
+        save_dir = save_dir / args.run_name
+    save_dir.mkdir(exist_ok=True, parents=True)
     best_val_r1 = 0.0
+    patience_counter = 0
+    early_stop_patience = cfg["training"].get("early_stop_patience", 0)
     global_step = start_epoch * len(train_loader)
 
     for epoch in range(start_epoch, cfg["training"]["epochs"]):
@@ -337,10 +382,12 @@ def main():
 
                 # MaxSim 打分
                 scores = max_sim_scores(c, text_tokens, text_mask)
-                scores = scores * model.logit_scale.exp().clamp(max=100.0)
+                logit_scale_max = loss_cfg.get("logit_scale_max", 100.0)
+                scores = scores * model.logit_scale.exp().clamp(max=logit_scale_max)
 
                 # 主损失
-                loss = info_nce_loss(scores)
+                label_smoothing = loss_cfg.get("label_smoothing", 0.0)
+                loss = info_nce_loss(scores, label_smoothing=label_smoothing)
 
                 # 辅助损失 (按需开启)
                 if loss_cfg["beta_div"] > 0:
@@ -422,6 +469,7 @@ def main():
                 video_ids=val_extra["unique_vids"],
                 all_w=val_extra["vid_w"],
                 codebook=model.codebook.detach().cpu(),
+                all_c=val_extra["vid_reprs"],
                 logger_fn=logger.info,
             )
 
@@ -438,10 +486,19 @@ def main():
 
         if val_metrics["R@1"] > best_val_r1:
             best_val_r1 = val_metrics["R@1"]
+            patience_counter = 0
             torch.save(ckpt_data, save_dir / "best.pt")
             logger.info(f"  ★ New best R@1: {best_val_r1:.2f}")
+        else:
+            patience_counter += 1
+
+        # 早停
+        if early_stop_patience > 0 and patience_counter >= early_stop_patience:
+            logger.info(f"  Early stopping at epoch {epoch+1} (patience={early_stop_patience})")
+            break
 
     logger.info(f"Training complete. Best Val R@1: {best_val_r1:.2f}")
+    return best_val_r1
 
 
 if __name__ == "__main__":

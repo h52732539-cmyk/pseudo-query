@@ -25,20 +25,23 @@ agc:
   dropout: 0.1
   lambda_init: 0.1
   tau_start: 1.0
-  tau_end: 0.1
+  tau_end: 0.3
   pool_type: "attention"
 
 loss:
   temperature_init: 0.07
-  beta_div: 0.5
-  beta_bal: 0.5
-  tau_div: 0.5
+  beta_div: 0.05
+  beta_bal: 0.1
+  tau_div: 0.3
+  label_smoothing: 0.1
+  logit_scale_max: 20.0
 
 training:
   epochs: 30
   batch_size: 32
-  lr: 1.0e-4
+  lr: 5.0e-5
   weight_decay: 0.01
+  early_stop_patience: 5
   warmup_ratio: 0.1
   gradient_clip: 1.0
   fp16: true

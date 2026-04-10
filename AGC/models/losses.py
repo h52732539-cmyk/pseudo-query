@@ -41,19 +41,20 @@ def max_sim_scores(
     return scores
 
 
-def info_nce_loss(scores: torch.Tensor) -> torch.Tensor:
+def info_nce_loss(scores: torch.Tensor, label_smoothing: float = 0.0) -> torch.Tensor:
     """
     对称 InfoNCE 损失。
 
     Args:
         scores: (B, B) — 分数矩阵，对角线为正样本
+        label_smoothing: float — label smoothing 系数
     Returns:
         loss: scalar
     """
     B = scores.size(0)
     labels = torch.arange(B, device=scores.device)
-    loss_v2t = F.cross_entropy(scores, labels)
-    loss_t2v = F.cross_entropy(scores.T, labels)
+    loss_v2t = F.cross_entropy(scores, labels, label_smoothing=label_smoothing)
+    loss_t2v = F.cross_entropy(scores.T, labels, label_smoothing=label_smoothing)
     return (loss_v2t + loss_t2v) / 2.0
 
 

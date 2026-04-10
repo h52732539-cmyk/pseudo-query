@@ -1,439 +1,166 @@
-# AGC 方案二：伪查询作为聚类中心 — 完整流程梳理
+﻿# AGC (Adaptive Granularity Clustering) 代码管道详解
 
-> 本文档基于 readme_AGC.md 梳理，不涉及其他项目代码，为全新管线的设计规格。
+AGC（ Adaptive Granularity Clustering / Pseudo-Query）的核心目标是完成**基于伪查询的视频-文本细粒度检索**。该架构摒弃了粗暴的全局池化，而是通过交叉注意力“路由”生成一定数量的语义中心（伪查询），以“聚类”的方式将长片段视频的冗余帧特征合理压缩，随后与文本 Tokens 展开局部最大相似度匹配（MaxSim）。
 
----
+## 1. 核心架构流 (Overall Pipeline Architecture)
 
-## 0. 整体架构概览
+整个前向传播高度结构化，被明确地划分为四个阶段 (Phase A - D)：
 
-```
-输入视频帧
-    │
-    ▼
-[视频 Token 化]  →  X ∈ R^{n×h}（n 个 patch token，维度 h）
-    │
-    ├──────────────────────────────┐
-    ▼                              ▼
-[Phase A: 伪查询生成]        [视频摘要 x̄]
-    │                              │
-    │◄─────────────────────────────┘
-    ▼
-Q_Ψ ∈ R^{m×h}（m 个伪查询）
-    │
-    ▼
-[Phase B: 联合编码 + 显著性计算]
-    │
-    ├── Z_X^(L) ∈ R^{n×h}（编码后视频 token）
-    ├── Z_Ψ^(L) ∈ R^{m×h}（编码后伪查询 = 聚类中心 μ）
-    └── α ∈ R^n（每个视频 token 的显著性分数）
-    │
-    ▼
-[Phase C: 聚类分配（Soft-to-Hard 退火）]
-    │
-    └── w_{kj}（视频 token j 被分配到聚类 k 的权重）
-    │
-    ▼
-[Phase D: 显著性加权聚合 + 残差锚定]
-    │
-    └── c_k ∈ R^h（k=1..m，最终压缩表示）
-    │
-    ▼
-[Phase E: 检索匹配 + 损失优化]
-    │
-    └── MaxSim(c, text) → InfoNCE loss
-```
+### 1.1 Phase A: 数据感知伪查询生成 (Data-Aware Pseudo Query Generation)
+首先通过 Attention Pooling 将输入视频帧聚合为全局摘要，加到**可学习元查询 (Meta-Queries)**上进行条件化。
+条件化查询与**全局可学习语义密码本 (Codebook)** 进行 Cross-Attention 路由，生成具有当前输入感知能力的伪查询 $Q_{\Psi}$。
+
+### 1.2 Phase B: 联合编码与显著性计算 (Joint Encoding & Saliency Computation)
+将原始视频 Tokens 和伪查询拼接，送入多层 Transformer 进行交互。
+提取最后一层的注意力权重（即伪查询如何“注视”视频帧），将其在聚类维度上取平均，作为视频帧的**显著性分数 $\alpha$**。这用于后续评估每一帧的重要程度。
+
+### 1.3 Phase C: Soft-to-Hard 退火聚类分配 (Soft-to-Hard Annealing Clustering)
+计算联合编码后的视频特征 $Z_X$ 与伪查询聚类中心 $Z_{\Psi}$ 的归一化余弦相似度。
+受一个线性下降的**退火温度调度器 ($\tau$)**的控制（由 `train.py` 从 $1.0$ 下降到 $0.1$），实施 Softmax。前期偏向软分配（平滑探索），训练后期逼近硬分配（聚类确立）。
+
+### 1.4 Phase D: 显著性加权聚合与残差锚定 (Weighted Aggregation & Residual Anchoring)
+将分配权重结合显著性 $\alpha$ 加权汇聚帧特征。
+引入受限的残差系数量 $\lambda$，将聚合后的特征与伪查询本身融合，输出规模为 $m \times h$ 的最精简聚类级视频表示 $C$。
 
 ---
 
-## 1. Phase A：数据感知伪查询生成
+## 2. 模块职责解析 (Module Responsibilities)
 
-### 1.1 可学习参数
+### 2.1 AGC/models/agc_module.py (模型网络层)
+*   **核心组件**：`AttentionPool`, `PseudoQueryGenerator`, `JointEncoder`, `AGCModel`主体。
+*   **主要职责**：承载并串联上述 Phases A-D，维护两大可学习基底参数 (Codebook $E$ 和 Meta-Queries $M$) 和残差参数 $\lambda$。输出压缩后的视频表示 $c$ 和所有的中间状态（激活值/注意力图）`aux`，以便给辅损失和 Monitor 分析。
 
-| 参数 | 形状 | 说明 |
-|------|------|------|
-| 全局语义密码本 $E$ | $K \times h$ | $K$=128~256，所有视频共享 |
-| 元查询 $M$ | $m \times h$ | $m$=32（默认），可学习初始化 |
+### 2.2 AGC/models/clip_encoder.py (文本侧处理)
+*   **主要职责**：引入并**完全冻结**预训练的 CLIP Text Encoder。
+*   **说明**：主要提供 Token 级特征 `encode_tokens`，保留文本细粒度语义以执行多对多 MaxSim 比对。
 
-### 1.2 前向流程
+### 2.3 AGC/models/losses.py (算分与损失项)
+*   **`max_sim_scores`**：利用 ColBERT 思想，将文本中的每一个有效词元去寻找对应匹配度最高的视频聚类中心（Max），随后求和得到总分，形成匹配矩阵。
+*   **`info_nce_loss`**：核心主损失。对称的跨模态 InfoNCE 损失。
+*   **辅助损失**：包含密码本多样性损失 `codebook_diversity_loss` 和 聚类均衡损失 `cluster_balance_loss`。分别对抗密码本“同质化”以及避免“旱的旱死、涝的涝死”带来的死聚类（Dead Cluster）。
 
-**Step 1 — 视频摘要提取**
+### 2.4 AGC/monitor.py (动态健康诊断系统)
+*   **主要职责**：用于决定是否要打开（或调大权重 `beta_div`/`beta_bal`）上述的辅助损失。
+*   **监控指标**：
+    *   **密码本健康度**：计算两两余弦相似度均值、最大值和特征的有效秩（Effective Rank）。
+    *   **聚类均衡度**：统计各聚类中心分配情况，计算**Gini系数**、变异系数和零负载死聚类占比。如果出现告警则在终端输出修改建议。
 
-对输入视频 token $X \in \mathbb{R}^{n \times h}$ 做注意力池化（attention pooling），得到视频级摘要向量：
-
-$$\bar{x} = \text{AttnPool}(X) \in \mathbb{R}^{h}$$
-
-具体实现：可用一个可学习的 query 向量 $q_{pool} \in \mathbb{R}^h$ 对 $X$ 做单头注意力：
-$$a_j = \frac{\exp(q_{pool}^\top X_j / \sqrt{h})}{\sum_{j'} \exp(q_{pool}^\top X_{j'} / \sqrt{h})}, \quad \bar{x} = \sum_j a_j X_j$$
-
-或更简单地使用均值池化 $\bar{x} = \frac{1}{n}\sum_j X_j$（但注意力池化更灵活）。
-
-**Step 2 — 条件化交叉注意力**
-
-$$Q_\Psi = \text{CrossAttn}(M + \bar{x},\ E,\ E) \in \mathbb{R}^{m \times h}$$
-
-- **Query**：$M + \bar{x}$（元查询广播加上视频摘要，使每个元查询感知当前视频内容）
-- **Key / Value**：密码本 $E$
-- 标准多头交叉注意力，全程可微，无 top-k 操作
-
-**关键点**：
-- 广播机制：$\bar{x}$ 是一个向量，加到 $M$ 的每一行上 → 所有元查询共享同一视频条件
-- 不同视频产生不同的 $Q_\Psi$，但都从同一密码本 $E$ 中路由，保证跨视频语义一致性
-- 计算量轻：$m$ 个 query × $K$ 个 key 的注意力矩阵，$m$=32, $K$≤256
-
-### 1.3 输出
-
-$Q_\Psi \in \mathbb{R}^{m \times h}$：$m$ 个数据感知的伪查询 token，将在 Phase B 与视频 token 联合编码。
+### 2.5 AGC/train.py & AGC/evaluate.py (全管线生命周期)
+*   **Train API (`AGC/train.py`)**：控制总步数中的全局 $\tau$（温度）线性退火，实现模型状态恢复 (Checkpoint)，执行 AMP 梯度缩放，并且定期触发 Monitor 健康检查日志。
+*   **Evaluate API (`AGC/evaluate.py`)**：利用 `precompute_video_representations` 将验证集/测试集视频**离线批处理预先特征化压缩**，规避了推断期间视频侧的大量重复运算。然后按文本进行分批快速计算 R@1、R@5、R@10、MdR 和 MnR 等检索核心性能指标。
 
 ---
 
-## 2. Phase B：联合编码 + 显著性计算
+## 3. 核心交互流图景 (Interaction Flow)
 
-### 2.1 前向流程
+整个交互流可以总结为以下步骤：
 
-**Step 1 — 拼接输入**
+1. **数据抓取**：`Dataset/Dataloader` 泵出预训练视觉帧矩阵 $X$ 和文本 Captions。
+2. **文本编码**：文本通过被冻结的 `CLIP` 文本编码器处理为 Tokens 序列，全程挂起无需梯度计算。
+3. **视频特征压缩**：$X$ 序列送入 `AGCModel`，经过：
+   * **汇聚条件化(Contextualization)** 
+   * **路由密码本得伪查询(Routing Codebook)** 
+   * **联合即插即用型Transformer编码(Joint Encoding)** 
+   * **退火分配成聚类表示 $C$(Annealed Clustering)**。
+4. **精细匹配**：生成的紧凑视频表示 $C$ 与 提取出的文本 Tokens 序列进入 `Losses::MaxSim`，计算序列与序列间的相似度，并生成批次对应的混淆打分矩阵。
+5. **反向传播**：对比学习损失 `InfoNCE` 及附加的正则化惩罚项进行反向传播，用于更新 Transformer，及其内部可学习的密码本基底参数和元查询中心，以此循环直至收敛网络。
 
-将伪查询 $Q_\Psi$ 与视频 token $X$ 拼接：
+以下是 AGC (Adaptive Granularity Clustering) 架构全管道的完整数学公式推导。我们将按照前向传播的时间线，从视频帧输入到最终计算损失，分阶段进行严格定义。
 
-$$\text{Input} = [X,\ Q_\Psi] \in \mathbb{R}^{(n+m) \times h}$$
-
-**Step 2 — Transformer 编码**
-
-送入共享的视觉编码器（如 ViT 的后续层或独立 Transformer 编码器）：
-
-$$[Z_X^{(L)},\ Z_\Psi^{(L)}] = F_{enc}([X,\ Q_\Psi];\ \theta)$$
-
-- $Z_X^{(L)} \in \mathbb{R}^{n \times h}$：编码后视频 token
-- $Z_\Psi^{(L)} \in \mathbb{R}^{m \times h}$：编码后伪查询
-
-伪查询通过自注意力与视频 token 交互，吸收视频内容信息。
-
-**Step 3 — 显著性分数计算**
-
-利用最后一层注意力中伪查询对视频 token 的注意力权重：
-
-$$\alpha_j = \frac{1}{|\Psi| \cdot H} \sum_{i \in \Psi} \sum_{\eta=1}^{H} \text{Attn}_{i \to j}^{(L, \eta)}$$
-
-- 对所有伪查询位置 $i$、所有注意力头 $\eta$ 取平均
-- $\alpha_j$ 衡量视频 token $j$ 被伪查询"关注"的程度 → 语义显著性
-- $\alpha \in \mathbb{R}^n$，所有分量之和不一定为 1（因为是多头多 query 平均）
-
-### 2.2 输出
-
-- $Z_X^{(L)}$：编码后视频 token（带上下文信息）
-- $Z_\Psi^{(L)}$：编码后伪查询 → **直接作为聚类中心 $\mu_k$**
-- $\alpha$：视频 token 显著性权重
+### **符号定义**
+*   $X \in \mathbb{R}^{n \times h}$: 视频帧提取的稠密特征（$n$ 为帧/Patch数量，$h$ 为特征维度）。
+*   $TEXT$: 输入的自然语言文本描述。
+*   $M \in \mathbb{R}^{m \times h}$: **可学习的元查询 (Meta-Queries)**，$m$ 为聚类中心的预设数量（如32）。
+*   $E \in \mathbb{R}^{K \times h}$: **可学习的全局语义密码本 (Codebook)**，$K$ 为字典大小（如128）。
+*   $\tau \in (0, 1]$: **退火温度参数**，随训练步数从 $1.0$ 线性衰减至接近 $0.1$。
 
 ---
 
-## 3. Phase C：聚类分配（Soft-to-Hard 退火）
+### **Phase A: 数据感知伪查询生成 (Data-Aware Pseudo-Query Generation)**
 
-### 3.1 聚类中心定义
+首先，为生成适合当前视频的伪查询 $Q_\Psi$，模型提取视频的全局上下文，以条件化元查询并从密码本中路由语义。
 
-$$\{\mu_k\}_{k=1}^m = Z_\Psi^{(L)}$$
+1. **视频注意力池化 (Attention Pooling)**
+   定义一个可学习的池化查询向量 $q_{pool} \in \mathbb{R}^h$，计算每个视频帧 $X_i$ 的注意力权重：
+   $$ a_i = \frac{\exp(q_{pool}^\top X_i / \sqrt{h})}{\sum_{j=1}^n \exp(q_{pool}^\top X_j / \sqrt{h})} $$
+   得到**视频全局摘要** $\bar{x} \in \mathbb{R}^h$:
+   $$ \bar{x} = \sum_{i=1}^n a_i X_i $$
 
-即第 $k$ 个聚类中心就是第 $k$ 个编码后伪查询。不需要额外选择步骤。
+2. **元查询条件化 (Conditioning)**
+   利用广播机制，将视频摘要附加到每一个元查询上：
+   $$ \tilde{M} = M + \bar{x} \quad (\tilde{M} \in \mathbb{R}^{m \times h}) $$
 
-### 3.2 分配权重计算
-
-对每个视频 token $j$ 和聚类 $k$，计算 softmax 分配：
-
-$$w_{kj} = \frac{\exp\bigl(\cos(Z_{X,j}^{(L)},\ \mu_k) / \tau\bigr)}{\sum_{k'=1}^{m} \exp\bigl(\cos(Z_{X,j}^{(L)},\ \mu_{k'}) / \tau\bigr)}$$
-
-- $\cos(\cdot, \cdot)$：余弦相似度
-- $\tau$：温度参数，控制分配硬度
-
-### 3.3 温度退火策略
-
-| 阶段 | 温度 $\tau$ | 分配行为 |
-|------|-------------|----------|
-| 训练初期 | 1.0 | 软分配，梯度平滑流动 |
-| 训练中期 | 线性退火 1.0 → 0.1 | 逐渐收紧 |
-| 训练后期 | 0.1 | 接近硬分配 |
-| 推理 | $\tau \to 0$（等效 argmax） | 完全硬分配 |
-
-退火调度建议：
-
-$$\tau(t) = \tau_{start} - (\tau_{start} - \tau_{end}) \cdot \frac{t}{T}$$
-
-其中 $t$ 为当前 step，$T$ 为总 step 数，$\tau_{start}=1.0$，$\tau_{end}=0.1$。
-
-### 3.4 硬分配（推理时）
-
-$$G_k = \{j\ |\ k = \arg\max_{k'} \cos(Z_{X,j}^{(L)},\ \mu_{k'})\}$$
-
-每个视频 token 唯一归属一个聚类。
-
-### 3.5 软硬切换的处理
-
-训练时全程使用软分配（$w_{kj}$ 连续），保证梯度流。推理时切换硬分配（argmax），效率等同原 AGC。
+3. **密码本路由 (Codebook Routing Cross-Attention)**
+   以条件化元查询 $\tilde{M}$ 为 Query，密码本 $E$ 为 Key 和 Value，进行交叉注意力机制，生成**伪查询** $Q_\Psi$：
+   $$ Q_\Psi = \text{Softmax}\left( \frac{\tilde{M} E^\top}{\sqrt{h}} \right) E \in \mathbb{R}^{m \times h} $$
 
 ---
 
-## 4. Phase D：显著性加权聚合 + 残差锚定
+### **Phase B: 联合编码与显著性计算 (Joint Encoding & Saliency)**
 
-### 4.1 聚合池化
+引入多层 Transformer Encoder，建立伪查询与原本视频序列之间的深层交互。
 
-**软分配下**（训练时）：
+1. **联合自注意力 (Joint Attention)**
+   将原始视频特征 $X$ 与伪查询 $Q_\Psi$ 在序列维度拼接，并传入 $L$ 层 Transformer：
+   $$ H^{(0)} = [X \parallel Q_\Psi] \in \mathbb{R}^{(n+m) \times h} $$
+   $$ H^{(L)} = \text{TransformerEncoder}(H^{(0)}) $$
+   分离输出，得到深层编码后的视频特征 $Z_X \in \mathbb{R}^{n \times h}$ 与编码后的伪查询 $Z_\Psi \in \mathbb{R}^{m \times h}$。
 
-$$\text{AggPool}_k = \frac{\sum_{j=1}^{n} w_{kj} \cdot \alpha_j \cdot Z_{X,j}^{(L)}}{\sum_{j=1}^{n} w_{kj} \cdot \alpha_j + \epsilon}$$
-
-- $w_{kj}$：聚类分配权重（软）
-- $\alpha_j$：显著性权重
-- $\epsilon$：数值稳定项（如 1e-8）
-
-**硬分配下**（推理时）：
-
-$$\text{AggPool}_k = \frac{\sum_{j \in G_k} \alpha_j \cdot Z_{X,j}^{(L)}}{\sum_{j \in G_k} \alpha_j + \epsilon}$$
-
-### 4.2 残差锚定
-
-$$c_k = (1 - \lambda) \cdot \text{AggPool}_k + \lambda \cdot Z_{\Psi,k}^{(L)}$$
-
-- $\lambda$：可学习标量，初始化为 0.1
-- **动机**：当某聚类被分配到极少 token 时，纯聚合不稳定（分母接近零），混入伪查询的语义表示作为"锚点"保证输出有意义
-- $\lambda = 0$ 时退化为标准加权聚合（无残差锚定）
-
-### 4.3 输出
-
-$\{c_k\}_{k=1}^m \in \mathbb{R}^{m \times h}$：$m$ 个压缩后的视频表示 token。
-
-- 原始 $n$ 个视频 token 被压缩为 $m$ 个（$m$=32 时压缩率约 97.5%）
-- 每个 $c_k$ 代表一个语义聚类的加权汇总
+2. **显著性分数计算 (Saliency Computation)**
+   提取最后一层 Transformer 的注意力矩阵对角块，即 $m$ 个伪查询对 $n$ 个视频帧的注意力权重矩阵 $A_{\Psi \rightarrow X} \in \mathbb{R}^{m \times n}$。
+   第 $i$ 帧的**显著性分数** $\alpha_i$ 为其接收到的平均关注度：
+   $$ \alpha_i = \frac{1}{m} \sum_{j=1}^m A_{\Psi \rightarrow X}[j, i] $$
 
 ---
 
-## 5. Phase E：检索匹配与损失优化
+### **Phase C: Soft-to-Hard 退火聚类分配 (Annealed Clustering)**
 
-### 5.1 检索匹配 — MaxSim
+计算每帧视频应归属于哪个聚类中心（伪查询）。
 
-给定文本查询 $q$ 经文本编码器得到 token 表示 $\{q_i\}$：
+1. **余弦相似度矩阵**
+   对于第 $i$ 帧特征 $Z_{X,i}$ 与第 $j$ 个伪查询 $Z_{\Psi,j}$：
+   $$ S_{i,j} = \frac{Z_{X,i}^\top Z_{\Psi,j}}{\|Z_{X,i}\|_2 \|Z_{\Psi,j}\|_2} $$
 
-$$\text{MaxSim}(c, q) = \sum_{i} \max_{k} \cos(c_k, q_i)$$
-
-- 对每个文本 token，找到与之最相似的视频聚类表示
-- 求和得到总匹配分数
-
-### 5.2 核心损失：$L_{retrieval}$
-
-$$L_{retrieval} = \text{InfoNCE}(\text{MaxSim}(c, q))$$
-
-标准 InfoNCE，batch 内负采样：
-
-$$L_{retrieval} = -\frac{1}{B} \sum_{i=1}^{B} \log \frac{\exp(\text{MaxSim}(c_i, q_i) / \tau_r)}{\sum_{j=1}^{B} \exp(\text{MaxSim}(c_i, q_j) / \tau_r)}$$
-
-- $B$：batch size
-- $\tau_r$：InfoNCE 温度参数（与聚类温度 $\tau$ 不同）
-- 正样本：匹配的视频-文本对
-- 负样本：同 batch 内非匹配对
-
-可选双向 InfoNCE（video→text + text→video 对称）。
-
-### 5.3 辅助损失分析与建议
-
-#### $L_{div}$（密码本多样性损失）
-
-$$L_{div} = \frac{1}{K(K-1)} \sum_{i \neq j} \max\bigl(0,\ \cos(E_i, E_j) - \tau_{div}\bigr)$$
-
-- 作用：防止密码本条目坍塌（多个条目趋向相同向量）
-- 建议系数 $\beta_1 = 0.1$，阈值 $\tau_{div} = 0.5$
-
-**是否必须？**
-
-不确定。密码本坍塌是否会在当前配置下发生，取决于：
-- 密码本大小 $K$ 与伪查询数 $m$ 的比值（$K/m$ = 4~8）
-- 数据多样性
-- 学习率与优化动态
-
-**建议策略**：
-
-1. **初始训练不加入** $L_{div}$（即 $\beta_1 = 0$）
-2. **在评估/验证阶段监控密码本多样性指标**：
-   - 两两余弦相似度矩阵 $S_{ij} = \cos(E_i, E_j)$
-   - 报告均值、最大值、以及超过 $\tau_{div}=0.5$ 的比例
-   - 有效秩（effective rank）：对 $E$ 做 SVD，计算归一化奇异值的熵
-3. **触发条件**：若观测到 $\max_{i \neq j} \cos(E_i, E_j) > 0.8$ 或有效秩大幅低于 $K$，再开启 $L_{div}$
-4. 这样避免引入不必要的正则项干扰主任务优化
-
-#### $L_{bal}$（负载均衡损失）
-
-$$L_{bal} = K \cdot \sum_{k=1}^{K} f_k \cdot p_k$$
-
-其中（注意：此处的 $K$ 应为聚类数 $m$，而非密码本大小，因为负载均衡针对的是聚类分配）：
-
-$$f_k = \frac{1}{n} \sum_{j=1}^{n} \mathbb{1}[\arg\max_{k'} w_{k'j} = k]$$
-$$p_k = \frac{1}{n} \sum_{j=1}^{n} w_{kj}$$
-
-- $f_k$：第 $k$ 个聚类被硬分配到的 token 比例
-- $p_k$：第 $k$ 个聚类的软分配权重均值
-- 建议系数 $\beta_2 = 0.01$
-
-**是否必须？**
-
-同样不确定。负载不均可能出现也可能不出现，取决于：
-- 视频语义分布
-- 伪查询初始化
-- 温度退火速度
-
-**建议策略**：
-
-1. **初始训练不加入** $L_{bal}$（即 $\beta_2 = 0$）
-2. **在评估/验证阶段监控聚类负载均衡指标**：
-   - 每个聚类分配到的 token 数量分布 $\{|G_k|\}_{k=1}^m$
-   - Gini 系数：衡量分配不均匀度（0=完全均匀，1=完全集中）
-   - 变异系数（CV）：$\text{std}(\{|G_k|\}) / \text{mean}(\{|G_k|\})$
-   - "死聚类"数量：$|G_k| = 0$ 的聚类个数
-3. **触发条件**：若 Gini > 0.3 或 死聚类 > 10% 的 $m$，再开启 $L_{bal}$
-
-### 5.4 完整损失函数
-
-$$L = L_{retrieval} + \beta_1 L_{div} + \beta_2 L_{bal}$$
-
-**推荐训练策略**：
-
-| 阶段 | $\beta_1$ | $\beta_2$ | 说明 |
-|------|-----------|-----------|------|
-| 第一阶段（探索） | 0 | 0 | 只用检索损失，观察自然行为 |
-| 第二阶段（按需引入） | 0.1（若需要） | 0.01（若需要） | 根据监控指标决定是否开启 |
+2. **退火 Softmax 分配权重**
+   使用温度调度器 $\tau$ 实现从软分配到硬分配的平滑过渡，得到分配权重矩阵 $W \in \mathbb{R}^{n \times m}$：
+   $$ w_{i,j} = \frac{\exp(S_{i,j} / \tau)}{\sum_{k=1}^m \exp(S_{i,k} / \tau)} $$
+   *(其中 $\sum_{j=1}^m w_{i,j} = 1$)*
 
 ---
 
-## 6. 完整训练流程
+### **Phase D: 显著性加权聚合与残差锚定 (Aggregation)**
 
-### 6.1 单步前向传播
+将上述得到的分配权重及先前的显著性分数结合，以得出最终的视频紧缩表征。
 
-```
-输入：视频帧 → 视觉 Token X ∈ R^{n×h}，文本 → 文本编码 {q_i}
+1. **局部联合加权规范化**
+   结合分配权重与该帧的显著性，针对每个聚类中心 $j$，在帧维度上进行规范化：
+   $$ \hat{w}_{i,j} = \frac{\alpha_i \cdot w_{i,j}}{\sum_{i'=1}^n \alpha_{i'} \cdot w_{i',j} + \epsilon} $$
 
-1. x̄ = AttnPool(X)                            # 视频摘要
-2. Q_Ψ = CrossAttn(M + x̄, E, E)              # 伪查询生成 [Phase A]
-3. [Z_X, Z_Ψ] = F_enc([X, Q_Ψ]; θ)           # 联合编码 [Phase B]
-4. α = mean_over_heads_and_queries(Attn_last)  # 显著性分数 [Phase B]
-5. μ = Z_Ψ                                     # 聚类中心 = 编码后伪查询 [Phase C]
-6. w = softmax(cos(Z_X, μ) / τ)               # 软分配 [Phase C]
-7. AggPool_k = Σ(w_kj · α_j · Z_Xj) / Σ(w_kj · α_j)  # 聚合 [Phase D]
-8. c_k = (1-λ) · AggPool_k + λ · Z_Ψk         # 残差锚定 [Phase D]
-9. score = MaxSim(c, q)                         # 检索打分 [Phase E]
-10. L = InfoNCE(score) [+ β1·L_div + β2·L_bal] # 损失 [Phase E]
-```
+2. **聚合特征 (Weighted Aggregation)**
+   获取第 $j$ 个中心的中间聚合特征 $V_j \in \mathbb{R}^h$：
+   $$ V_j = \sum_{i=1}^n \hat{w}_{i,j} Z_{X,i} $$
 
-### 6.2 反向传播梯度流路径
-
-```
-L_retrieval
-  ↓
-MaxSim(c, q)
-  ↓
-c_k = (1-λ)·AggPool_k + λ·Z_Ψk
-  ↓                        ↓
-  ├── ∂L/∂AggPool_k       ├── ∂L/∂Z_Ψk → 编码器 θ → 伪查询 Q_Ψ → 密码本 E, 元查询 M
-  │     ↓
-  │   ∂L/∂w_kj (通过 softmax, 可微)
-  │     ↓
-  │   ∂L/∂μ_k = ∂L/∂Z_Ψk (同上)
-  │   ∂L/∂Z_Xj → 编码器 θ
-  │     ↓
-  │   ∂L/∂α_j (通过注意力权重, 可微)
-  │     ↓
-  └── 编码器 θ → Q_Ψ → CrossAttn → E, M, x̄ → AttnPool → X
-```
-
-**全程可微**：没有 top-k、argmax 或其他不连续操作在训练路径中。
-
-### 6.3 可学习参数清单
-
-| 参数 | 形状 | 初始化建议 |
-|------|------|------------|
-| 密码本 $E$ | $K \times h$ | 正态分布 $\mathcal{N}(0, 1/\sqrt{h})$ |
-| 元查询 $M$ | $m \times h$ | 正态分布 $\mathcal{N}(0, 1/\sqrt{h})$ |
-| 残差系数 $\lambda$ | 标量 | 0.1 |
-| 注意力池化 query $q_{pool}$（若使用） | $h$ | 正态分布 |
-| 交叉注意力层参数 $W_Q, W_K, W_V, W_O$ | 标准 | Xavier/Kaiming |
-| 编码器 $F_{enc}$ 参数 $\theta$ | 预训练 | 从 CLIP ViT 加载 |
-
-### 6.4 温度退火实现
-
-每个 training step 更新：
-
-$$\tau = \max\bigl(\tau_{end},\ \tau_{start} - (\tau_{start} - \tau_{end}) \cdot \frac{\text{step}}{\text{total\_steps}}\bigr)$$
-
-不是可学习参数，是调度器控制的超参数。
+3. **残差锚定 (Residual Anchoring)**
+   为防止聚合过程中聚类崩塌或过度偏离原义，利用可学习的门控参数 $\lambda \in [0, 1]$ 引入初始生成时的残差 $Q_\Psi$：
+   $$ C_j = V_j + \lambda Q_{\Psi, j} $$
+   **最终的视频极简聚类集**即为 $C = \{C_1, C_2, \dots, C_m\} \in \mathbb{R}^{m \times h}$。
 
 ---
 
-## 7. 推理流程
+### **Phase E: Late Interaction 与 损失优化 (MaxSim & Loss)**
 
-```
-输入：视频帧 → X
+这里，通过完全独立的冻结 `CLIP Text Encoder` 处理文本 $TEXT$，输出文本词元特征 $T \in \mathbb{R}^{L \times h}$，并使用 $\text{mask}_l \in \{0,1\}$ 排除 Padding。
 
-1. x̄ = AttnPool(X)
-2. Q_Ψ = CrossAttn(M + x̄, E, E)
-3. [Z_X, Z_Ψ] = F_enc([X, Q_Ψ]; θ)
-4. α = 显著性分数
-5. G_k = {j | k = argmax_k' cos(Z_Xj, Z_Ψk')}   # 硬分配
-6. AggPool_k = Σ_{j∈G_k} α_j·Z_Xj / Σ_{j∈G_k} α_j
-7. c_k = (1-λ)·AggPool_k + λ·Z_Ψk
-8. 存储 {c_k} 作为视频索引
-```
+1. **细粒度词级最大相似度 (MaxSim)**
+   视频表征 $C$ 与 文本表征 $T$ 的得分为每个词元对应的**最大视频聚类相似度之和**：
+   $$ \text{score}(C, T) = \frac{1}{\sum_{l=1}^L \text{mask}_l} \sum_{l=1}^L \text{mask}_l \left( \max_{j \in [1,m]} \frac{C_j^\top T_l}{\|C_j\|_2 \|T_l\|_2} \right) $$
 
-查询时：$\text{score} = \text{MaxSim}(c, q)$，按分数排序返回结果。
+2. **跨模态对比损失 (InfoNCE Loss)**
+   在一个拥有 $B$ 个视频-文本配对的 Batch 中（引入可学习温度标量 $\gamma$ 放大差异）：
+   $$ \mathcal{L}_{NCE} = - \frac{1}{B} \sum_{b=1}^B \log \frac{\exp(\gamma \cdot \text{score}(C_b, T_b))}{\sum_{b'=1}^B \exp(\gamma \cdot \text{score}(C_b, T_{b'}))} $$
+   *(实际实现中是对称损失，即同时计算 Text-to-Video 和 Video-to-Text 的交叉熵并求均值)*
 
-额外开销 vs 原 AGC：仅多一次交叉注意力（Step 2），$m \times K$ 规模，可忽略不计。
-
----
-
-## 8. 评估阶段监控指标（用于决定是否引入辅助损失）
-
-### 8.1 密码本健康度（决定是否需要 $L_{div}$）
-
-| 指标 | 计算方式 | 健康阈值 | 报警阈值 |
-|------|----------|----------|----------|
-| 两两余弦相似度均值 | $\frac{1}{K(K-1)}\sum_{i \neq j}\cos(E_i, E_j)$ | < 0.3 | > 0.5 |
-| 两两余弦最大值 | $\max_{i \neq j}\cos(E_i, E_j)$ | < 0.6 | > 0.8 |
-| 有效秩 | $\exp(-\sum_i \hat{\sigma}_i \log \hat{\sigma}_i)$，$\hat{\sigma}$ 为归一化奇异值 | > 0.5$K$ | < 0.3$K$ |
-| 高相似度对比例 | $\cos > 0.5$ 的 pair 占比 | < 5% | > 20% |
-
-### 8.2 聚类均衡度（决定是否需要 $L_{bal}$）
-
-| 指标 | 计算方式 | 健康阈值 | 报警阈值 |
-|------|----------|----------|----------|
-| Gini 系数 | 标准 Gini 公式 on $\{|G_k|\}$ | < 0.2 | > 0.3 |
-| 变异系数 (CV) | $\text{std}/\text{mean}$ of $\{|G_k|\}$ | < 0.5 | > 1.0 |
-| 死聚类比例 | $\frac{|\{k : |G_k|=0\}|}{m}$ | 0% | > 10% |
-| 最大聚类占比 | $\max_k |G_k| / n$ | < $3/m$ | > $5/m$ |
-
-### 8.3 监控频率
-
-- 每 N 个 epoch（如 N=1~5）在验证集上计算上述指标
-- 记录趋势：若指标持续恶化，才引入对应辅助损失
-- 可视化：密码本 t-SNE / PCA + 聚类分配热力图
-
----
-
-## 9. 超参数汇总
-
-| 超参数 | 默认值 | 说明 |
-|--------|--------|------|
-| $m$（伪查询数/聚类数） | 32 | ~97.5% 压缩率 |
-| $K$（密码本大小） | 128~256 | $4\text{-}8 \times m$ |
-| $h$（特征维度） | 取决于视觉编码器 | 如 CLIP ViT-B/32 为 512 |
-| $\tau_{start}$（聚类初始温度） | 1.0 | |
-| $\tau_{end}$（聚类终止温度） | 0.1 | |
-| $\tau_r$（InfoNCE 温度） | 待定 | 通常 0.07 或可学习 |
-| $\lambda$（残差锚定系数） | 0.1（可学习） | |
-| $\beta_1$（$L_{div}$ 系数） | 0（按需开启，建议值 0.1） | |
-| $\beta_2$（$L_{bal}$ 系数） | 0（按需开启，建议值 0.01） | |
-| $\tau_{div}$（多样性阈值） | 0.5 | |
-
----
-
-## 10. 消融实验计划（后续验证用）
-
-| 实验 | 修改 | 验证目标 |
-|------|------|----------|
-| 无密码本 | 去掉 $E$，$Q_\Psi = M + \bar{x}$ | 密码本的价值 |
-| 无残差锚定 | $\lambda = 0$ 固定 | 残差锚定的稳定性 |
-| 无退火 | $\tau$ 固定为 1.0 或 0.1 | 退火策略的贡献 |
-| 无显著性 | $\alpha_j = 1\ \forall j$ | 显著性权重的作用 |
-| 硬分配训练 | 训练时也用 argmax（straight-through） | soft-to-hard 的优势 |
-| 加 $L_{div}$ | $\beta_1 = 0.1$ | 多样性损失的影响 |
-| 加 $L_{bal}$ | $\beta_2 = 0.01$ | 负载均衡损失的影响 |
+3. **辅助罚项优化 (Auxiliary Penalties)**
+   - **群组均衡损失 (Balance Loss)**: 惩罚使得聚类分配过于集中的情况，计算所有帧到聚类的边际分布概率 $P(j) = \frac{1}{n} \sum_{i=1}^n w_{i,j}$ 的负熵：
+     $$ \mathcal{L}_{bal} = \sum_{j=1}^m P(j) \log P(j) $$
+   - **总体目标**: $\mathcal{L}_{Total} = \mathcal{L}_{NCE} + \beta_{bal} \cdot \mathcal{L}_{bal} + \text{Diversity Loss}$ (如有)。

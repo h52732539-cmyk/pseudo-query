@@ -31,8 +31,7 @@ sys.path.insert(0, str(AGC_DIR))
 from data.dataset import AGCDataset, agc_collate_fn
 from models.clip_encoder import CLIPTextEncoder
 from models.agc_module import AGCModel
-from models.losses import max_sim_scores, info_nce_loss, codebook_diversity_loss, cluster_balance_loss
-from monitor import compute_codebook_health, compute_cluster_balance
+from models.losses import max_sim_scores, info_nce_loss, orthogonal_regularization_loss
 from failure_analysis import run_failure_analysis
 
 
@@ -67,19 +66,10 @@ def build_retrieval_pairs(video_ids, gt, frame_feat_dir):
     return pairs
 
 
-# ─────────────── 温度退火 ───────────────
-
-def get_annealing_tau(step: int, total_steps: int, tau_start: float, tau_end: float) -> float:
-    """线性退火: τ 从 tau_start 下降到 tau_end。"""
-    progress = min(step / max(total_steps, 1), 1.0)
-    tau = tau_start - (tau_start - tau_end) * progress
-    return max(tau, tau_end)
-
-
 # ─────────────── 验证 ───────────────
 
 @torch.no_grad()
-def validate(model, text_encoder, val_loader, device, tau, cfg, collect_w=False):
+def validate(model, text_encoder, val_loader, device, cfg):
     """验证集上计算平均 loss 和 R@1/R@5/R@10。"""
     model.eval()
     total_loss = 0.0
@@ -87,7 +77,6 @@ def validate(model, text_encoder, val_loader, device, tau, cfg, collect_w=False)
 
     # 同时收集视频表示用于检索评估
     vid_reprs = {}   # vid → (m, h)
-    vid_w = {}       # vid → (n, m) 聚类分配权重 (用于失效分析)
     query_vids = []  # 每个 query 对应的 GT vid
     query_texts = []
 
@@ -99,7 +88,7 @@ def validate(model, text_encoder, val_loader, device, tau, cfg, collect_w=False)
         text_tokens, text_mask = text_encoder.encode_tokens(captions, device=device)
 
         with autocast("cuda", enabled=use_amp):
-            c, aux = model(features, tau=tau)
+            c, aux = model(features)
             scores = max_sim_scores(c, text_tokens, text_mask)
             logit_scale_max = cfg.get("loss", {}).get("logit_scale_max", 100.0)
             scores = scores * model.logit_scale.exp().clamp(max=logit_scale_max)
@@ -113,10 +102,6 @@ def validate(model, text_encoder, val_loader, device, tau, cfg, collect_w=False)
         for i, vid in enumerate(video_ids):
             if vid not in vid_reprs:
                 vid_reprs[vid] = c[i].cpu()
-                if collect_w and "w" in aux:
-                    # 取实际 token 数 (非 padding)
-                    n_tokens = mask[i].sum().int().item() if mask is not None else aux["w"].size(1)
-                    vid_w[vid] = aux["w"][i, :n_tokens].cpu()
             query_vids.append(vid)
             query_texts.append(captions[i])
 
@@ -168,7 +153,7 @@ def validate(model, text_encoder, val_loader, device, tau, cfg, collect_w=False)
 
     model.train()
     return avg_loss, metrics, {"all_scores": all_scores.cpu(), "query_vids": query_vids,
-                                "unique_vids": unique_vids, "vid_w": vid_w,
+                                "unique_vids": unique_vids,
                                 "vid_reprs": vid_reprs}
 
 
@@ -294,13 +279,11 @@ def main():
     loss_cfg = cfg["loss"]
     model = AGCModel(
         feature_dim=cfg["encoder"]["feature_dim"],
-        codebook_size=agc_cfg["codebook_size"],
         num_pseudo_queries=agc_cfg["num_pseudo_queries"],
-        num_encoder_layers=agc_cfg["num_encoder_layers"],
+        num_qformer_layers=agc_cfg["num_qformer_layers"],
         num_heads=agc_cfg["num_heads"],
         ffn_dim=agc_cfg["ffn_dim"],
         dropout=agc_cfg["dropout"],
-        lambda_init=agc_cfg["lambda_init"],
         pool_type=agc_cfg["pool_type"],
         temperature_init=loss_cfg["temperature_init"],
     ).to(device)
@@ -366,19 +349,13 @@ def main():
         for video_ids, captions, features, mask in pbar:
             features = features.to(device)
 
-            # 温度退火
-            tau = get_annealing_tau(
-                global_step, total_steps,
-                agc_cfg["tau_start"], agc_cfg["tau_end"],
-            )
-
             # 文本编码 (冻结)
             with torch.no_grad():
                 text_tokens, text_mask = text_encoder.encode_tokens(captions, device=device)
 
             with autocast("cuda", enabled=use_amp):
-                # AGC 前向
-                c, aux = model(features, tau=tau)
+                # Q-Former 前向
+                c, aux = model(features)
 
                 # MaxSim 打分
                 scores = max_sim_scores(c, text_tokens, text_mask)
@@ -389,14 +366,11 @@ def main():
                 label_smoothing = loss_cfg.get("label_smoothing", 0.0)
                 loss = info_nce_loss(scores, label_smoothing=label_smoothing)
 
-                # 辅助损失 (按需开启)
-                if loss_cfg["beta_div"] > 0:
-                    loss_div = codebook_diversity_loss(model.codebook, loss_cfg["tau_div"])
-                    loss = loss + loss_cfg["beta_div"] * loss_div
-
-                if loss_cfg["beta_bal"] > 0:
-                    loss_bal = cluster_balance_loss(aux["w"])
-                    loss = loss + loss_cfg["beta_bal"] * loss_bal
+                # 正交正则化损失
+                beta_ortho = loss_cfg.get("beta_ortho", 0.0)
+                if beta_ortho > 0:
+                    loss_ortho = orthogonal_regularization_loss(c)
+                    loss = loss + beta_ortho * loss_ortho
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -412,8 +386,6 @@ def main():
 
             pbar.set_postfix(
                 loss=f"{loss.item():.4f}",
-                tau=f"{tau:.3f}",
-                lam=f"{model.lambda_val.item():.3f}",
                 scale=f"{model.logit_scale.exp().item():.2f}",
             )
 
@@ -421,11 +393,10 @@ def main():
 
         # 验证
         mon_cfg = cfg.get("monitor", {})
-        val_tau = agc_cfg["tau_end"]  # 验证用接近硬分配
         fa_every = mon_cfg.get("failure_analysis_every_n_epochs", 5)
         do_fa = ((epoch + 1) % fa_every == 0) or (epoch == cfg["training"]["epochs"] - 1)
         val_loss, val_metrics, val_extra = validate(
-            model, text_encoder, val_loader, device, val_tau, cfg, collect_w=do_fa
+            model, text_encoder, val_loader, device, cfg
         )
 
         logger.info(
@@ -436,39 +407,34 @@ def main():
             f"R@5: {val_metrics['R@5']:.2f} | "
             f"R@10: {val_metrics['R@10']:.2f} | "
             f"MdR: {val_metrics['MdR']:.1f} | "
-            f"τ: {tau:.3f} | λ: {model.lambda_val.item():.3f}"
+            f"scale: {model.logit_scale.exp().item():.2f}"
         )
 
-        # 监控指标 (每 N epochs)
+        # 监控: 伪查询多样性 (每 N epochs)
         check_every = mon_cfg.get("check_every_n_epochs", 1)
         if (epoch + 1) % check_every == 0:
-            cb_health = compute_codebook_health(model.codebook.detach())
+            # 抽取最后一个 batch 的输出计算伪查询间平均余弦相似度
+            with torch.no_grad():
+                c_last = c.detach()
+                c_norm_mon = F.normalize(c_last, dim=-1)
+                gram = torch.bmm(c_norm_mon, c_norm_mon.transpose(1, 2))  # (B, m, m)
+                m_size = gram.size(1)
+                mask_diag = ~torch.eye(m_size, dtype=torch.bool, device=gram.device).unsqueeze(0)
+                off_diag = gram.masked_select(mask_diag)
+                pq_cos_mean = off_diag.mean().item()
+                pq_cos_max = off_diag.max().item()
             logger.info(
-                f"  [Monitor] Codebook — cos_mean: {cb_health['cos_mean']:.3f}, "
-                f"cos_max: {cb_health['cos_max']:.3f}, "
-                f"effective_rank: {cb_health['effective_rank']:.1f}, "
-                f"high_sim_ratio: {cb_health['high_sim_ratio']:.3f}"
+                f"  [Monitor] PseudoQuery diversity — cos_mean: {pq_cos_mean:.3f}, "
+                f"cos_max: {pq_cos_max:.3f}"
             )
 
-            # 用最后一个 batch 的 w 计算聚类均衡
-            if "w" in aux:
-                cl_balance = compute_cluster_balance(aux["w"].detach())
-                logger.info(
-                    f"  [Monitor] Cluster — gini: {cl_balance['gini']:.3f}, "
-                    f"cv: {cl_balance['cv']:.3f}, "
-                    f"dead_ratio: {cl_balance['dead_ratio']:.3f}, "
-                    f"max_load: {cl_balance['max_load_ratio']:.3f}"
-                )
-
         # 失效分析 (每 N epochs 或最后一个 epoch)
-        if do_fa and val_extra["vid_w"]:
+        if do_fa:
             logger.info(f"  [Epoch {epoch+1}] 运行失效分析 ...")
             fa_report = run_failure_analysis(
                 all_scores=val_extra["all_scores"],
                 query_vid_map=val_extra["query_vids"],
                 video_ids=val_extra["unique_vids"],
-                all_w=val_extra["vid_w"],
-                codebook=model.codebook.detach().cpu(),
                 all_c=val_extra["vid_reprs"],
                 logger_fn=logger.info,
             )

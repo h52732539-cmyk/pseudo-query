@@ -84,11 +84,10 @@ def compute_metrics(scores, query_vid_map, video_ids):
 # ─────────────── 预计算视频表示 ───────────────
 
 @torch.no_grad()
-def precompute_video_representations(model, video_ids, frame_feat_dir, device, batch_size=64, tau=0.01):
-    """对所有视频计算压缩表示 {c_k} 和聚类分配 w。"""
+def precompute_video_representations(model, video_ids, frame_feat_dir, device, batch_size=64):
+    """对所有视频计算压缩表示 {c_k}。"""
     feat_dir = Path(frame_feat_dir)
     all_c = {}
-    all_w = {}
 
     valid_vids = [v for v in video_ids if (feat_dir / f"{v}.pt").exists()]
     logger.info(f"Computing representations for {len(valid_vids)} videos ...")
@@ -96,11 +95,9 @@ def precompute_video_representations(model, video_ids, frame_feat_dir, device, b
     for start in tqdm(range(0, len(valid_vids), batch_size), desc="Video encoding"):
         batch_vids = valid_vids[start:start + batch_size]
         feats = []
-        feat_lens = []
         for vid in batch_vids:
             f = torch.load(feat_dir / f"{vid}.pt", weights_only=True).float()
             feats.append(f)
-            feat_lens.append(f.size(0))
 
         # 对齐长度
         max_n = max(f.size(0) for f in feats)
@@ -111,14 +108,11 @@ def precompute_video_representations(model, video_ids, frame_feat_dir, device, b
             padded[i, :f.size(0)] = f
         padded = padded.to(device)
 
-        c, aux = model(padded, tau=tau)  # (B, m, h)
+        c, aux = model(padded)  # (B, m, h)
         for i, vid in enumerate(batch_vids):
             all_c[vid] = c[i].cpu()
-            # 取实际 token 数 (非 padding)
-            n_tokens = feat_lens[i]
-            all_w[vid] = aux["w"][i, :n_tokens].cpu()
 
-    return all_c, all_w
+    return all_c
 
 
 # ─────────────── 评估入口 ───────────────
@@ -127,10 +121,9 @@ def precompute_video_representations(model, video_ids, frame_feat_dir, device, b
 def evaluate(model, text_encoder, video_ids, gt, frame_feat_dir, device, cfg):
     """完整评估流程。"""
     model.eval()
-    tau = cfg["agc"]["tau_end"]
 
     # Step 1: 预计算视频表示
-    all_c, all_w = precompute_video_representations(model, video_ids, frame_feat_dir, device, tau=tau)
+    all_c = precompute_video_representations(model, video_ids, frame_feat_dir, device)
     valid_vids = [v for v in video_ids if v in all_c]
 
     # Step 2: 构建查询列表
@@ -169,7 +162,7 @@ def evaluate(model, text_encoder, video_ids, gt, frame_feat_dir, device, cfg):
 
     # Step 4: 计算指标
     metrics, ranks = compute_metrics(all_scores, query_vid_map, valid_vids)
-    return metrics, ranks, all_scores, query_vid_map, valid_vids, all_w, all_c
+    return metrics, ranks, all_scores, query_vid_map, valid_vids, all_c
 
 
 def main():
@@ -215,13 +208,11 @@ def main():
     loss_cfg = saved_cfg["loss"]
     model = AGCModel(
         feature_dim=saved_cfg["encoder"]["feature_dim"],
-        codebook_size=agc_cfg["codebook_size"],
         num_pseudo_queries=agc_cfg["num_pseudo_queries"],
-        num_encoder_layers=agc_cfg["num_encoder_layers"],
+        num_qformer_layers=agc_cfg.get("num_qformer_layers", agc_cfg.get("num_encoder_layers", 4)),
         num_heads=agc_cfg["num_heads"],
         ffn_dim=agc_cfg["ffn_dim"],
         dropout=agc_cfg["dropout"],
-        lambda_init=agc_cfg["lambda_init"],
         pool_type=agc_cfg["pool_type"],
         temperature_init=loss_cfg["temperature_init"],
     ).to(device)
@@ -241,7 +232,7 @@ def main():
     )
     eval_ids = val_ids if args.split == "val" else test_ids
 
-    metrics, ranks, all_scores, query_vid_map, valid_vids, all_w, all_c = evaluate(
+    metrics, ranks, all_scores, query_vid_map, valid_vids, all_c = evaluate(
         model, text_encoder, eval_ids, gt, cfg["data"]["frame_feat_dir"], device, cfg
     )
 
@@ -263,8 +254,6 @@ def main():
             all_scores=all_scores,
             query_vid_map=query_vid_map,
             video_ids=valid_vids,
-            all_w=all_w,
-            codebook=model.codebook.detach().cpu(),
             all_c=all_c,
             logger_fn=logger.info,
         )

@@ -1,5 +1,5 @@
 """
-损失函数: MaxSim 评分、InfoNCE、密码本多样性损失、聚类均衡损失。
+损失函数: MaxSim 评分、InfoNCE、正交正则化、密码本多样性损失(deprecated)、聚类均衡损失(deprecated)。
 """
 import torch
 import torch.nn.functional as F
@@ -56,6 +56,28 @@ def info_nce_loss(scores: torch.Tensor, label_smoothing: float = 0.0) -> torch.T
     loss_v2t = F.cross_entropy(scores, labels, label_smoothing=label_smoothing)
     loss_t2v = F.cross_entropy(scores.T, labels, label_smoothing=label_smoothing)
     return (loss_v2t + loss_t2v) / 2.0
+
+
+def orthogonal_regularization_loss(c: torch.Tensor) -> torch.Tensor:
+    """
+    正交正则化损失: 强制 m 个伪查询表示在余弦空间中相互正交，防止同质化。
+
+    L_ortho = (1/B) * Σ_b || C_b_norm @ C_b_norm^T - I_m ||_F^2
+
+    Args:
+        c: (B, m, h) — 压缩后视频表示
+    Returns:
+        loss: scalar
+    """
+    B, m, h = c.shape
+    c_norm = F.normalize(c, dim=-1)  # (B, m, h)
+    # Gram 矩阵: (B, m, m)
+    gram = torch.bmm(c_norm, c_norm.transpose(1, 2))
+    # 目标: 单位矩阵
+    eye = torch.eye(m, device=c.device, dtype=c.dtype).unsqueeze(0)  # (1, m, m)
+    # Frobenius 范数的平方
+    loss = ((gram - eye) ** 2).sum(dim=(1, 2)).mean()
+    return loss
 
 
 def codebook_diversity_loss(codebook: torch.Tensor, tau_div: float = 0.5) -> torch.Tensor:

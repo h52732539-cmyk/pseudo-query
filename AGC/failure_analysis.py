@@ -459,7 +459,7 @@ def run_failure_analysis(
     all_scores,
     query_vid_map,
     video_ids,
-    all_w,
+    all_w=None,
     codebook=None,
     all_c=None,
     logger_fn=None,
@@ -471,7 +471,7 @@ def run_failure_analysis(
         all_scores:    (N_q, N_v) 得分矩阵
         query_vid_map: list[str] 第 i 个 query 对应的 GT video_id
         video_ids:     list[str] 所有候选视频 ID
-        all_w:         dict vid -> (n_frames, m) 软分配权重 (m 从此读取)
+        all_w:         dict vid -> (n_frames, m) 软分配权重 (可选, Q-Former 范式下无此项)
         codebook:      (K, h) 保留参数，兼容旧调用方，分析中不再使用
         all_c:         dict vid -> (m, h) 压缩视频表示 (可选，用于区分度分析)
         logger_fn:     可选日志函数

@@ -31,7 +31,7 @@ sys.path.insert(0, str(AGC_DIR))
 from data.dataset import AGCDataset, agc_collate_fn
 from models.clip_encoder import CLIPTextEncoder
 from models.agc_module import AGCModel
-from models.losses import max_sim_scores, info_nce_loss, orthogonal_regularization_loss
+from models.losses import max_sim_scores, info_nce_loss, attention_diversity_loss
 from failure_analysis import run_failure_analysis
 
 
@@ -366,11 +366,12 @@ def main():
                 label_smoothing = loss_cfg.get("label_smoothing", 0.0)
                 loss = info_nce_loss(scores, label_smoothing=label_smoothing)
 
-                # 正交正则化损失
-                beta_ortho = loss_cfg.get("beta_ortho", 0.0)
-                if beta_ortho > 0:
-                    loss_ortho = orthogonal_regularization_loss(c)
-                    loss = loss + beta_ortho * loss_ortho
+                # 注意力多样性损失 (取代 orthogonal_regularization_loss)
+                beta_attn_div = loss_cfg.get("beta_attn_div", 0.0)
+                if beta_attn_div > 0:
+                    cross_attn_w = aux["cross_attn_weights"]  # (B, m, n)
+                    loss_attn_div = attention_diversity_loss(cross_attn_w)
+                    loss = loss + beta_attn_div * loss_attn_div
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -413,9 +414,9 @@ def main():
         # 监控: 伪查询多样性 (每 N epochs)
         check_every = mon_cfg.get("check_every_n_epochs", 1)
         if (epoch + 1) % check_every == 0:
-            # 抽取最后一个 batch 的输出计算伪查询间平均余弦相似度
             with torch.no_grad():
                 c_last = c.detach()
+                # 1) 输出特征余弦相似度 (检测全局坍缩)
                 c_norm_mon = F.normalize(c_last, dim=-1)
                 gram = torch.bmm(c_norm_mon, c_norm_mon.transpose(1, 2))  # (B, m, m)
                 m_size = gram.size(1)
@@ -423,9 +424,18 @@ def main():
                 off_diag = gram.masked_select(mask_diag)
                 pq_cos_mean = off_diag.mean().item()
                 pq_cos_max = off_diag.max().item()
+                # 2) 注意力权重多样性 (检测注意力分散程度)
+                attn_w = aux["cross_attn_weights"]  # (B, m, n)
+                if attn_w is not None:
+                    attn_gram = torch.bmm(attn_w.detach(), attn_w.detach().transpose(1, 2))
+                    attn_off = attn_gram.masked_select(mask_diag)
+                    attn_overlap_mean = attn_off.mean().item()
+                else:
+                    attn_overlap_mean = float('nan')
             logger.info(
-                f"  [Monitor] PseudoQuery diversity — cos_mean: {pq_cos_mean:.3f}, "
-                f"cos_max: {pq_cos_max:.3f}"
+                f"  [Monitor] PseudoQuery — feature_cos_mean: {pq_cos_mean:.3f}, "
+                f"feature_cos_max: {pq_cos_max:.3f}, "
+                f"attn_overlap_mean: {attn_overlap_mean:.4f}"
             )
 
         # 失效分析 (每 N epochs 或最后一个 epoch)

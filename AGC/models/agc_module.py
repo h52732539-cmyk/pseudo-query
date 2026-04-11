@@ -78,13 +78,16 @@ class QFormerBlock(nn.Module):
         self.norm3 = nn.LayerNorm(feature_dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, queries: torch.Tensor, video_tokens: torch.Tensor) -> torch.Tensor:
+    def forward(self, queries: torch.Tensor, video_tokens: torch.Tensor,
+                need_attn_weights: bool = False):
         """
         Args:
             queries: (B, m, h) — 伪查询
             video_tokens: (B, n, h) — 视频帧特征
+            need_attn_weights: 是否返回交叉注意力权重
         Returns:
             queries: (B, m, h) — 更新后的伪查询
+            attn_weights: (B, m, n) — 交叉注意力权重 (仅当 need_attn_weights=True)
         """
         # Self-Attention
         residual = queries
@@ -93,14 +96,19 @@ class QFormerBlock(nn.Module):
 
         # Cross-Attention
         residual = queries
-        ca_out, _ = self.cross_attn(queries, video_tokens, video_tokens)
+        ca_out, attn_weights = self.cross_attn(
+            queries, video_tokens, video_tokens,
+            need_weights=need_attn_weights, average_attn_weights=True,
+        )
         queries = self.norm2(residual + self.dropout(ca_out))
 
         # FFN
         residual = queries
         queries = self.norm3(residual + self.ffn(queries))
 
-        return queries
+        if need_attn_weights:
+            return queries, attn_weights  # attn_weights: (B, m, n)
+        return queries, None
 
 
 class PseudoQueryGenerator(nn.Module):
@@ -148,12 +156,13 @@ class PseudoQueryGenerator(nn.Module):
         # 输出归一化
         self.output_norm = nn.LayerNorm(feature_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor):
         """
         Args:
             x: (B, n, h) — 视频帧特征
         Returns:
             Z_Psi: (B, m, h) — 伪查询表示
+            last_attn_weights: (B, m, n) — 最后一层交叉注意力权重
         """
         B = x.size(0)
 
@@ -171,11 +180,15 @@ class PseudoQueryGenerator(nn.Module):
         video_tokens = self.video_norm(x)  # (B, n, h)
 
         # Step 4: 多层 Q-Former 交叉注意力聚合
-        for layer in self.layers:
-            queries = layer(queries, video_tokens)  # (B, m, h)
+        last_attn_weights = None
+        for i, layer in enumerate(self.layers):
+            is_last = (i == len(self.layers) - 1)
+            queries, attn_w = layer(queries, video_tokens, need_attn_weights=is_last)
+            if is_last:
+                last_attn_weights = attn_w  # (B, m, n)
 
         Z_Psi = self.output_norm(queries)
-        return Z_Psi
+        return Z_Psi, last_attn_weights
 
 
 # ─────────────── 完整模型 ───────────────
@@ -229,19 +242,20 @@ class AGCModel(nn.Module):
             aux: dict — 中间结果（用于监控）
         """
         # Q-Former 生成伪查询表示
-        Z_Psi = self.pq_generator(video_tokens)  # (B, m, h)
+        Z_Psi, last_attn_weights = self.pq_generator(video_tokens)  # (B, m, h), (B, m, n)
 
         # 直接作为视频的 multi-vector 表示
         c = Z_Psi
 
         aux = {
             "Z_Psi": Z_Psi,
+            "cross_attn_weights": last_attn_weights,  # (B, m, n) 用于注意力多样性损失
         }
 
         return c, aux
 
     def encode_video(self, video_tokens: torch.Tensor):
-        """推理用: 编码视频为压缩表示。"""
+        """推理用: 编码视频为压缩表示 (不需要注意力权重)。"""
         with torch.no_grad():
             c, _ = self.forward(video_tokens)
         return c

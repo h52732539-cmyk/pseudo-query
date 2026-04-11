@@ -1,5 +1,5 @@
 """
-损失函数: MaxSim 评分、InfoNCE、正交正则化、密码本多样性损失(deprecated)、聚类均衡损失(deprecated)。
+损失函数: MaxSim 评分、InfoNCE、注意力多样性损失、正交正则化(deprecated)、密码本多样性损失(deprecated)、聚类均衡损失(deprecated)。
 """
 import torch
 import torch.nn.functional as F
@@ -60,9 +60,9 @@ def info_nce_loss(scores: torch.Tensor, label_smoothing: float = 0.0) -> torch.T
 
 def orthogonal_regularization_loss(c: torch.Tensor) -> torch.Tensor:
     """
-    正交正则化损失: 强制 m 个伪查询表示在余弦空间中相互正交，防止同质化。
-
-    L_ortho = (1/B) * Σ_b || C_b_norm @ C_b_norm^T - I_m ||_F^2
+    [Deprecated] 正交正则化损失: 直接约束输出特征正交。
+    已被 attention_diversity_loss 取代 — 直接约束特征会导致模型将静态元查询 M 优化为
+    正交基并关闭交叉注意力，造成全局坍缩。
 
     Args:
         c: (B, m, h) — 压缩后视频表示
@@ -70,12 +70,34 @@ def orthogonal_regularization_loss(c: torch.Tensor) -> torch.Tensor:
         loss: scalar
     """
     B, m, h = c.shape
-    c_norm = F.normalize(c, dim=-1)  # (B, m, h)
-    # Gram 矩阵: (B, m, m)
+    c_norm = F.normalize(c, dim=-1)
     gram = torch.bmm(c_norm, c_norm.transpose(1, 2))
-    # 目标: 单位矩阵
-    eye = torch.eye(m, device=c.device, dtype=c.dtype).unsqueeze(0)  # (1, m, m)
-    # Frobenius 范数的平方
+    eye = torch.eye(m, device=c.device, dtype=c.dtype).unsqueeze(0)
+    loss = ((gram - eye) ** 2).sum(dim=(1, 2)).mean()
+    return loss
+
+
+def attention_diversity_loss(attn_weights: torch.Tensor) -> torch.Tensor:
+    """
+    注意力多样性损失: 强制 m 个伪查询关注视频的不同帧/位置。
+
+    对最后一层 Cross-Attention 的注意力权重矩阵 A ∈ R^{B×m×n} 施加约束:
+        L_attn_div = (1/B) * Σ_b || A_b @ A_b^T - I_m ||_F^2
+
+    相比 orthogonal_regularization_loss (约束输出特征):
+    - 约束的是动态的交互过程 (注意力分配)，而非静态参数
+    - 模型无法通过优化元查询 M 本身来作弊，必须实际关注不同帧
+    - 只要不同伪查询关注不同帧，提取的特征自然具有多样性
+
+    Args:
+        attn_weights: (B, m, n) — 交叉注意力权重 (已经过 softmax，每行和为 1)
+    Returns:
+        loss: scalar
+    """
+    B, m, n = attn_weights.shape
+    # A @ A^T: (B, m, m) — 衡量不同伪查询注意力模式的重叠程度
+    gram = torch.bmm(attn_weights, attn_weights.transpose(1, 2))
+    eye = torch.eye(m, device=attn_weights.device, dtype=attn_weights.dtype).unsqueeze(0)
     loss = ((gram - eye) ** 2).sum(dim=(1, 2)).mean()
     return loss
 

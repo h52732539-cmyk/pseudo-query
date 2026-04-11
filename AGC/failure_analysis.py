@@ -437,7 +437,7 @@ def diagnose(margin, score_var, cluster_util, repr_disc):
 
     severity = min(severity, 10)
     if severity >= 7:
-        severity_label = "严重 — 建议: 开启 L_bal+L_div 辅助损失，调高 tau_end (>=0.3)，或增大 num_pseudo_queries"
+        severity_label = "严重 — 建议: 增大 beta_attn_div，增加 num_qformer_layers 或 num_pseudo_queries"
     elif severity >= 4:
         severity_label = "中等 — 建议调整辅助损失权重，重点关注聚类崩塌问题"
     elif severity >= 2:

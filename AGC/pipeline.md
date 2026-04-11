@@ -19,7 +19,7 @@ AGC（ Adaptive Granularity Clustering / Pseudo-Query）的核心目标是完成
 
 ### 1.2 Phase B: Late Interaction 与损失优化 (MaxSim & Loss)
 
-通过冻结的 CLIP Text Encoder 获取文本 Token 特征 $T \in \mathbb{R}^{L \times h}$。视频表示 $C$ 与 $T$ 进行 MaxSim 匹配（每个文本词元找最相似的视频伪查询），计算跨模态 InfoNCE 损失，配合**正交正则化 $\mathcal{L}_{ortho}$** 保证伪查询多样性。
+通过冻结的 CLIP Text Encoder 获取文本 Token 特征 $T \in \mathbb{R}^{L \times h}$。视频表示 $C$ 与 $T$ 进行 MaxSim 匹配（每个文本词元找最相似的视频伪查询），计算跨模态 InfoNCE 损失，配合**注意力多样性损失 $\mathcal{L}_{attn\_div}$** 保证伪查询关注视频的不同位置。
 
 ---
 
@@ -36,13 +36,13 @@ AGC（ Adaptive Granularity Clustering / Pseudo-Query）的核心目标是完成
 ### 2.3 AGC/models/losses.py (算分与损失项)
 *   **`max_sim_scores`**：利用 ColBERT 思想，将文本中的每一个有效词元去寻找对应匹配度最高的视频伪查询表示（Max），随后求和得到总分，形成匹配矩阵。
 *   **`info_nce_loss`**：核心主损失。对称的跨模态 InfoNCE 损失。
-*   **`orthogonal_regularization_loss`**：正交正则化损失，强制 $m$ 个伪查询表示相互正交，防止坍缩为同质化表示。
+*   **`attention_diversity_loss`**：注意力多样性损失，约束 Q-Former 最后一层交叉注意力权重矩阵 $A$，强制 $m$ 个伪查询关注视频的不同帧/位置，从而避免全局坍缩。
 
 ### 2.4 AGC/monitor.py (动态健康诊断系统)
-*   **主要职责**：保留为兼容工具。训练循环中改为直接计算伪查询间余弦相似度来监控多样性。
+*   **主要职责**：保留为兼容工具。训练循环中监控两个指标：伪查询输出特征的余弦相似度（检测全局坍缩）和交叉注意力权重重叠度（检测注意力是否分散）。
 
 ### 2.5 AGC/train.py & AGC/evaluate.py (全管线生命周期)
-*   **Train API (`AGC/train.py`)**：实现模型状态恢复 (Checkpoint)，执行 AMP 梯度缩放，定期监控伪查询多样性（平均余弦相似度），定期触发失效分析。
+*   **Train API (`AGC/train.py`)**：实现模型状态恢复 (Checkpoint)，执行 AMP 梯度缩放，定期监控伪查询多样性（输出特征余弦相似度 + 注意力权重重叠度），定期触发失效分析。
 *   **Evaluate API (`AGC/evaluate.py`)**：利用 `precompute_video_representations` 将验证集/测试集视频**离线批处理预先特征化压缩**，然后按文本进行分批快速计算 R@1、R@5、R@10、MdR 和 MnR 等检索核心性能指标。
 
 ---
@@ -55,7 +55,7 @@ AGC（ Adaptive Granularity Clustering / Pseudo-Query）的核心目标是完成
    * **注意力池化 + 元查询条件化 (Conditioning)**
    * **多层 Q-Former 交叉注意力聚合 (Cross-Attention Aggregation)**
 4. **精细匹配**：生成的 $m$ 个连续视频表示 $C$ 与文本 Tokens 序列进入 `Losses::MaxSim`，计算序列与序列间的相似度，生成匹配打分矩阵。
-5. **反向传播**：对比学习损失 `InfoNCE` 与正交正则化 $\mathcal{L}_{ortho}$ 进行反向传播，更新 Q-Former 各层参数和可学习的元查询，以此循环直至收敛。
+5. **反向传播**：对比学习损失 `InfoNCE` 与注意力多样性损失 $\mathcal{L}_{attn\_div}$ 进行反向传播，更新 Q-Former 各层参数和可学习的元查询，以此循环直至收敛。
 
 ---
 
@@ -117,10 +117,12 @@ $$ \text{score}(C, T) = \sum_{l=1}^L \text{mask}_l \left( \max_{j \in [1,m]} \fr
 在一个拥有 $B$ 个视频-文本配对的 Batch 中（引入可学习温度标量 $\gamma$ 放大差异）：
 $$ \mathcal{L}_{NCE} = - \frac{1}{2B} \sum_{b=1}^B \left[ \log \frac{\exp(\gamma \cdot \text{score}(C_b, T_b))}{\sum_{b'} \exp(\gamma \cdot \text{score}(C_b, T_{b'}))} + \log \frac{\exp(\gamma \cdot \text{score}(C_b, T_b))}{\sum_{b'} \exp(\gamma \cdot \text{score}(C_{b'}, T_b))} \right] $$
 
-#### 3. 正交正则化损失 (Orthogonal Regularization)
-强制 $m$ 个伪查询表示相互正交，防止同质化坍缩：
-$$ \mathcal{L}_{ortho} = \frac{1}{B} \sum_{b=1}^B \left\| \hat{C}_b \hat{C}_b^\top - I_m \right\|_F^2 $$
-其中 $\hat{C}_b$ 为 $C_b$ 逐行 L2 归一化后的矩阵，$I_m$ 为 $m$ 阶单位矩阵。
+#### 3. 注意力多样性损失 (Attention Diversity Loss)
+强制 $m$ 个伪查询在交叉注意力中关注视频的不同帧/位置，避免全局坍缩。提取最后一层 Cross-Attention 权重 $A \in \mathbb{R}^{B \times m \times n}$：
+$$ \mathcal{L}_{attn\_div} = \frac{1}{B} \sum_{b=1}^B \left\| A_b A_b^\top - I_m \right\|_F^2 $$
+其中 $A_b$ 是第 $b$ 个样本的交叉注意力权重矩阵（已经过 softmax，每行和为 1）。该损失要求不同伪查询的注意力模式相互正交（关注不重叠的帧区域）。
+
+> **为何不用 $\mathcal{L}_{ortho}$？** 直接约束输出特征 $C$ 正交会导致模型将静态元查询 $M$ 优化为正交基并关闭交叉注意力，造成全局坍缩。$\mathcal{L}_{attn\_div}$ 约束的是动态交互过程，模型无法作弊。
 
 #### 4. 总体目标
-$$ \mathcal{L}_{Total} = \mathcal{L}_{NCE} + \beta_{ortho} \cdot \mathcal{L}_{ortho} $$
+$$ \mathcal{L}_{Total} = \mathcal{L}_{NCE} + \beta_{attn\_div} \cdot \mathcal{L}_{attn\_div} $$
